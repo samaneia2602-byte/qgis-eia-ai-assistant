@@ -100,7 +100,7 @@ class EiaAiAssistantPlugin:
     def on_layers_added(self, layers):
         """
         QGIS에 새로 추가된 레이어 중에서
-        좌표계가 없는 벡터 레이어를 검사합니다.
+        좌표계 정의 파일이 없는 SHP를 검사합니다.
         """
         for layer in layers:
             if not isinstance(layer, QgsVectorLayer):
@@ -109,11 +109,22 @@ class EiaAiAssistantPlugin:
             if not layer.isValid():
                 continue
 
-            # 이미 정상적인 좌표계가 있으면 검사하지 않습니다.
-            if layer.crs().isValid():
-                continue
+            source_path = layer.source().split("|")[0]
 
-            # 레이어 추가 작업이 끝난 후 안내창을 표시합니다.
+            if source_path.lower().endswith(".shp"):
+                base_path = os.path.splitext(source_path)[0]
+
+                has_prj = os.path.exists(base_path + ".prj")
+                has_qpj = os.path.exists(base_path + ".qpj")
+
+                # 실제 좌표계 정의 파일이 있으면 검사하지 않습니다.
+                if has_prj or has_qpj:
+                    continue
+            else:
+                # SHP 이외의 벡터 레이어는 기존 CRS 검사 사용
+                if layer.crs().isValid():
+                    continue
+
             QTimer.singleShot(
                 0,
                 lambda current_layer=layer:
@@ -129,9 +140,6 @@ class EiaAiAssistantPlugin:
             return
 
         if not layer.isValid():
-            return
-
-        if layer.crs().isValid():
             return
 
         result = self.crs_advisor.recommend(layer)
