@@ -1,0 +1,10 @@
+[general]
+name=QGIS EIA AI Assistant
+description=환경영향평가 실무용 QGIS 대화형 자동화 플러그인(API Manager 구조)
+version=0.2.0
+qgisMinimumVersion=3.16
+author=OpenAI ChatGPT
+email=
+about=자연어 명령, API Key 관리, 지리정보 불러오기, 지목분석, 표고경사분석 확장을 위한 모듈형 구조입니다.
+category=Plugins
+icon=icon.png
