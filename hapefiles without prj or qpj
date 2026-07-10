@@ -1,0 +1,70 @@
+warning: in the working copy of 'plugin.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/plugin.py b/plugin.py[m
+[1mindex 72d629d..6f1ac70 100644[m
+[1m--- a/plugin.py[m
+[1m+++ b/plugin.py[m
+[36m@@ -98,27 +98,38 @@[m [mclass EiaAiAssistantPlugin:[m
+             self.dialog = None[m
+ [m
+     def on_layers_added(self, layers):[m
+[31m-        """[m
+[31m-        QGIS에 새로 추가된 레이어 중에서[m
+[31m-        좌표계가 없는 벡터 레이어를 검사합니다.[m
+[31m-        """[m
+[31m-        for layer in layers:[m
+[31m-            if not isinstance(layer, QgsVectorLayer):[m
+[31m-                continue[m
+[32m+[m[32m    """[m
+[32m+[m[32m    QGIS에 새로 추가된 레이어 중에서[m
+[32m+[m[32m    좌표계 정의 파일이 없는 SHP를 검사합니다.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    for layer in layers:[m
+[32m+[m[32m        if not isinstance(layer, QgsVectorLayer):[m
+[32m+[m[32m            continue[m
+ [m
+[31m-            if not layer.isValid():[m
+[31m-                continue[m
+[32m+[m[32m        if not layer.isValid():[m
+[32m+[m[32m            continue[m
+[32m+[m
+[32m+[m[32m        source_path = layer.source().split("|")[0][m
+[32m+[m
+[32m+[m[32m        if source_path.lower().endswith(".shp"):[m
+[32m+[m[32m            base_path = os.path.splitext(source_path)[0][m
+ [m
+[31m-            # 이미 정상적인 좌표계가 있으면 검사하지 않습니다.[m
+[32m+[m[32m            has_prj = os.path.exists(base_path + ".prj")[m
+[32m+[m[32m            has_qpj = os.path.exists(base_path + ".qpj")[m
+[32m+[m
+[32m+[m[32m            # 실제 좌표계 정의 파일이 있으면 검사하지 않습니다.[m
+[32m+[m[32m            if has_prj or has_qpj:[m
+[32m+[m[32m                continue[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            # SHP 이외의 벡터 레이어는 기존 CRS 검사 사용[m
+             if layer.crs().isValid():[m
+                 continue[m
+ [m
+[31m-            # 레이어 추가 작업이 끝난 후 안내창을 표시합니다.[m
+[31m-            QTimer.singleShot([m
+[31m-                0,[m
+[31m-                lambda current_layer=layer:[m
+[31m-                self.advise_crs(current_layer),[m
+[31m-            )[m
+[32m+[m[32m        QTimer.singleShot([m
+[32m+[m[32m            0,[m
+[32m+[m[32m            lambda current_layer=layer:[m
+[32m+[m[32m            self.advise_crs(current_layer),[m
+[32m+[m[32m        )[m
+ [m
+     def advise_crs(self, layer):[m
+         """[m
+[36m@@ -131,9 +142,6 @@[m [mclass EiaAiAssistantPlugin:[m
+         if not layer.isValid():[m
+             return[m
+ [m
+[31m-        if layer.crs().isValid():[m
+[31m-            return[m
+[31m-[m
+         result = self.crs_advisor.recommend(layer)[m
+ [m
+         if not result:[m

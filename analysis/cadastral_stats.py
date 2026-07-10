@@ -133,7 +133,10 @@ def _resolve_jimok_field(layer):
 
 
 def clip_cadastral(business_layer, cadastral_layer):
-    """CRS를 맞춘 뒤 연속지적도를 사업지역으로 자릅니다."""
+    """
+    연속지적도의 유효하지 않은 도형을 먼저 수정한 뒤,
+    사업지역 경계로 Clip 합니다.
+    """
     overlay = business_layer
 
     if business_layer.crs() != cadastral_layer.crs():
@@ -148,17 +151,40 @@ def clip_cadastral(business_layer, cadastral_layer):
     else:
         overlay = _overlay_input(business_layer)
 
+    # 사업지역 도형도 먼저 수정
+    fixed_overlay = processing.run(
+        "native:fixgeometries",
+        {
+            "INPUT": overlay,
+            "METHOD": 1,
+            "OUTPUT": "memory:",
+        },
+    )["OUTPUT"]
+
+    # 연속지적도 유효하지 않은 도형 자동 수정
+    fixed_cadastral = processing.run(
+        "native:fixgeometries",
+        {
+            "INPUT": cadastral_layer,
+            "METHOD": 1,
+            "OUTPUT": "memory:",
+        },
+    )["OUTPUT"]
+
+    fixed_cadastral.setName("연속지적도_도형수정")
+
     clipped = processing.run(
         "native:clip",
         {
-            "INPUT": cadastral_layer,
-            "OVERLAY": overlay,
+            "INPUT": fixed_cadastral,
+            "OVERLAY": fixed_overlay,
             "OUTPUT": "memory:",
         },
     )["OUTPUT"]
 
     clipped.setName("사업지역_연속지적도_클립")
     QgsProject.instance().addMapLayer(clipped)
+
     return clipped
 
 
