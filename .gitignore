@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# QGIS/Python temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Environment and secret files
+.env
+.env.*
+secrets.json
+credentials.json
+
+# Local settings containing API keys
+local_settings.py
