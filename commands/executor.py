@@ -3,7 +3,7 @@
 import os
 
 from qgis.PyQt.QtWidgets import QFileDialog
-from qgis.core import QgsProject, QgsVectorLayer, QgsRectangle
+from qgis.core import QgsProject, QgsRectangle, QgsVectorLayer
 
 from .parser import parse_command
 from ..analysis.cadastral_stats import run_cadastral_area_analysis
@@ -67,6 +67,7 @@ class CommandExecutor:
             "",
             "Vector files (*.shp *.gpkg *.geojson *.dxf);;All files (*.*)",
         )
+
         if not path:
             return
 
@@ -75,6 +76,7 @@ class CommandExecutor:
             os.path.basename(path),
             "ogr",
         )
+
         if layer.isValid():
             QgsProject.instance().addMapLayer(layer)
             self.log("파일을 열었습니다: %s" % path)
@@ -83,11 +85,13 @@ class CommandExecutor:
 
     def jimok_cleanup(self):
         layer = self.iface.activeLayer()
+
         if not layer:
             self.log("오류: 현재 선택된 레이어가 없습니다.")
             return
 
         result = cleanup_jimok(layer)
+
         if isinstance(result, dict):
             self.log(
                 "'지목' 필드를 생성/갱신했습니다. "
@@ -104,23 +108,24 @@ class CommandExecutor:
             )
 
     def cadastral_stats(self):
-        default_name = "사업지역_지목별_면적.xlsx"
         output_path, _ = QFileDialog.getSaveFileName(
             self.iface.mainWindow(),
             "지목별 면적 결과 Excel 저장",
-            default_name,
+            "사업지역_지목별_면적.xlsx",
             "Excel 통합문서 (*.xlsx)",
         )
+
         if not output_path:
             self.log("지목별 면적 산출을 취소했습니다.")
             return
 
-        self.log("사업지역과 연속지적도를 중첩 분석하는 중입니다...")
+        self.log("지목별 면적 분석을 시작합니다.")
 
         try:
             result = run_cadastral_area_analysis(
                 self.iface,
                 output_path,
+                self.log,
             )
         except Exception as exc:
             self.log("오류: 지목별 면적 산출에 실패했습니다.")
@@ -134,21 +139,11 @@ class CommandExecutor:
                 result["total_area_m2"],
             )
         )
-        self.log(
-            "사업지역 레이어: %s"
-            % result["business_layer"]
-        )
-        self.log(
-            "연속지적도 레이어: %s"
-            % result["cadastral_layer"]
-        )
-        self.log(
-            "Excel 저장: %s"
-            % result["output_path"]
-        )
+        self.log("Excel 저장: %s" % result["output_path"])
 
     def zoomout_10km(self):
         layer = self.iface.activeLayer()
+
         if not layer:
             self.log("오류: 현재 선택된 레이어가 없습니다.")
             return
@@ -157,4 +152,7 @@ class CommandExecutor:
         rect.grow(10000)
         self.iface.mapCanvas().setExtent(rect)
         self.iface.mapCanvas().refresh()
-        self.log("선택 레이어 범위 기준 10km 줌아웃했습니다.")
+
+        self.log(
+            "선택 레이어 범위 기준 10km 줌아웃했습니다."
+        )
