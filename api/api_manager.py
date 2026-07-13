@@ -321,8 +321,23 @@ class ApiManager:
                 )
                 continue
 
-            if not tile_layer.crs().isValid():
-                tile_layer.setCrs(target_crs)
+            # 생태자연도 WFS 응답의 좌표값은 EPSG:5186인데,
+            # GML 메타데이터가 없거나 잘못되어 QGIS가 EPSG:3857로
+            # 오인하는 경우가 있습니다. 좌표를 변환하지 않고
+            # 원 좌표값에 EPSG:5186을 강제로 지정합니다.
+            detected_crs = (
+                tile_layer.crs().authid()
+                if tile_layer.crs().isValid()
+                else "미지정"
+            )
+            if detected_crs != target_crs.authid():
+                self.log(
+                    "생태자연도 응답 CRS를 %s에서 "
+                    "EPSG:5186으로 바로잡습니다."
+                    % detected_crs
+                )
+
+            tile_layer.setCrs(target_crs)
 
             feature_count = tile_layer.featureCount()
 
@@ -381,7 +396,13 @@ class ApiManager:
             return None
 
         merged.setName("생태자연도_WFS_분할병합")
+        merged.setCrs(target_crs)
         QgsProject.instance().addMapLayer(merged)
+
+        self.log(
+            "최종 생태자연도 레이어 좌표계: %s"
+            % merged.crs().authid()
+        )
 
         self.log(
             "생태자연도 병합 완료: 원본 %s건 → "
@@ -505,11 +526,9 @@ class ApiManager:
         geometry_name = QgsWkbTypes.displayString(
             first_layer.wkbType()
         )
-        auth_id = (
-            first_layer.crs().authid()
-            if first_layer.crs().isValid()
-            else target_crs.authid()
-        )
+        # 각 격자 응답의 실제 좌표값은 EPSG:5186이므로
+        # 병합 레이어도 반드시 EPSG:5186으로 생성합니다.
+        auth_id = target_crs.authid()
 
         merged = QgsVectorLayer(
             "%s?crs=%s"
