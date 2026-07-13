@@ -10,6 +10,7 @@ from ..analysis.cadastral_stats import run_cadastral_area_analysis
 from ..analysis.jimok import cleanup_jimok
 from ..api.api_manager import ApiManager
 from ..ui.api_settings import ApiSettingsDialog
+from ..ui.cadastral_options_dialog import CadastralOptionsDialog
 
 
 class CommandExecutor:
@@ -108,16 +109,28 @@ class CommandExecutor:
             )
 
     def cadastral_stats(self):
-        output_path, _ = QFileDialog.getSaveFileName(
-            self.iface.mainWindow(),
-            "지목별 면적 결과 Excel 저장",
-            "사업지역_지목별_면적.xlsx",
-            "Excel 통합문서 (*.xlsx)",
+        dialog = CadastralOptionsDialog(
+            self.iface.mainWindow()
         )
 
-        if not output_path:
+        if not dialog.exec_():
             self.log("지목별 면적 산출을 취소했습니다.")
             return
+
+        options = dialog.options()
+        output_path = None
+
+        if options.get("save_excel", True):
+            output_path, _ = QFileDialog.getSaveFileName(
+                self.iface.mainWindow(),
+                "지목별 면적 결과 Excel 저장",
+                "사업지역_지목별_면적.xlsx",
+                "Excel 통합문서 (*.xlsx)",
+            )
+
+            if not output_path:
+                self.log("Excel 저장 위치를 선택하지 않아 분석을 취소했습니다.")
+                return
 
         self.log("지목별 면적 분석을 시작합니다.")
 
@@ -125,6 +138,7 @@ class CommandExecutor:
             result = run_cadastral_area_analysis(
                 self.iface,
                 output_path,
+                options,
                 self.log,
             )
         except Exception as exc:
@@ -132,14 +146,21 @@ class CommandExecutor:
             self.log(str(exc))
             return
 
+        if options.get("show_chat_table", True):
+            for line in result.get("chat_lines", []):
+                self.log(line)
+
         self.log(
-            "지목별 면적 산출 완료: %s개 지목, 총면적 %.2f㎡"
+            "지목별 면적 산출 완료: "
+            "%s개 지목, 총면적 %.2f㎡"
             % (
                 result["category_count"],
                 result["total_area_m2"],
             )
         )
-        self.log("Excel 저장: %s" % result["output_path"])
+
+        if result.get("output_path"):
+            self.log("Excel 저장: %s" % result["output_path"])
 
     def zoomout_10km(self):
         layer = self.iface.activeLayer()

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import os
 import processing
 from collections import defaultdict
 
@@ -18,8 +19,12 @@ from qgis.core import (
 
 
 JIMOK_SOURCE_FIELDS = (
-    "지목", "jimok_cls", "jibun",
-    "bonbun", "bubun", "addr",
+    "지목",
+    "jimok_cls",
+    "jibun",
+    "bonbun",
+    "bubun",
+    "addr",
 )
 
 
@@ -52,11 +57,9 @@ def _cadastral_score(layer):
         if candidate.lower() in names:
             score += 15
 
-    layer_name = layer.name().lower()
-    for keyword in (
-        "지적", "연속지적", "vworld", "cadastral",
-    ):
-        if keyword in layer_name:
+    name = layer.name().lower()
+    for keyword in ("지적", "연속지적", "vworld", "cadastral"):
+        if keyword in name:
             score += 30
 
     return score
@@ -64,13 +67,13 @@ def _cadastral_score(layer):
 
 def _business_score(layer):
     score = 0
-    layer_name = layer.name().lower()
+    name = layer.name().lower()
 
     for keyword in (
         "사업", "사업지역", "경계", "부지",
         "구역", "boundary", "site", "bo",
     ):
-        if keyword in layer_name:
+        if keyword in name:
             score += 15
 
     if layer.selectedFeatureCount() > 0:
@@ -96,7 +99,6 @@ def find_analysis_layers(iface):
         )
 
     active = iface.activeLayer()
-
     cadastral = sorted(
         polygon_layers,
         key=_cadastral_score,
@@ -127,8 +129,9 @@ def find_analysis_layers(iface):
     return business, cadastral
 
 
-def _overlay_input(layer):
-    if layer.selectedFeatureCount() > 0:
+def _source_definition(layer, selected_only=False):
+    use_selected = selected_only and layer.selectedFeatureCount() > 0
+    if use_selected:
         return QgsProcessingFeatureSourceDefinition(
             layer.id(),
             selectedFeaturesOnly=True,
@@ -138,7 +141,6 @@ def _overlay_input(layer):
 
 def _resolve_jimok_field(layer):
     names = _field_names(layer)
-
     for candidate in ("지목", "jimok_cls"):
         if candidate.lower() in names:
             return names[candidate.lower()]
@@ -161,7 +163,6 @@ def _fix_geometries(input_layer, name, log_callback=None):
     )["OUTPUT"]
 
     fixed.setName("%s_도형수정" % name)
-
     _log(
         log_callback,
         "%s 도형 수정 완료: %s개 객체"
@@ -190,42 +191,51 @@ def _create_spatial_index(layer, name, log_callback=None):
 def clip_cadastral(
     business_layer,
     cadastral_layer,
+    selected_only=False,
+    add_clip_layer=True,
     log_callback=None,
 ):
-    overlay = business_layer
+    overlay = _source_definition(
+        business_layer,
+        selected_only=selected_only,
+    )
 
     if business_layer.crs() != cadastral_layer.crs():
         _log(
             log_callback,
             "사업지역 CRS를 연속지적도 CRS에 맞추는 중입니다...",
         )
-
         overlay = processing.run(
             "native:reprojectlayer",
             {
-                "INPUT": _overlay_input(business_layer),
+                "INPUT": overlay,
                 "TARGET_CRS": cadastral_layer.crs(),
                 "OUTPUT": "memory:",
             },
         )["OUTPUT"]
-
         overlay.setName("사업지역_CRS변환")
         _log(log_callback, "사업지역 CRS 변환 완료")
-    else:
-        overlay = _overlay_input(business_layer)
 
     fixed_overlay = _fix_geometries(
-        overlay, "사업지역", log_callback
+        overlay,
+        "사업지역",
+        log_callback,
     )
     fixed_cadastral = _fix_geometries(
-        cadastral_layer, "연속지적도", log_callback
+        cadastral_layer,
+        "연속지적도",
+        log_callback,
     )
 
     _create_spatial_index(
-        fixed_overlay, "사업지역", log_callback
+        fixed_overlay,
+        "사업지역",
+        log_callback,
     )
     _create_spatial_index(
-        fixed_cadastral, "연속지적도", log_callback
+        fixed_cadastral,
+        "연속지적도",
+        log_callback,
     )
 
     _log(
@@ -261,7 +271,9 @@ def clip_cadastral(
     )["OUTPUT"]
 
     singleparts.setName("사업지역_연속지적도_클립")
-    QgsProject.instance().addMapLayer(singleparts)
+
+    if add_clip_layer:
+        QgsProject.instance().addMapLayer(singleparts)
 
     _log(
         log_callback,
@@ -310,9 +322,11 @@ def summarize_by_jimok(clipped_layer, log_callback=None):
             "사업지역과 연속지적도의 중첩 결과가 없습니다."
         )
 
+    total_count = sum(
+        item["count"] for item in summary.values()
+    )
     total_area = sum(
-        item["area_m2"]
-        for item in summary.values()
+        item["area_m2"] for item in summary.values()
     )
 
     rows = []
@@ -341,10 +355,10 @@ def summarize_by_jimok(clipped_layer, log_callback=None):
         % len(rows),
     )
 
-    return rows, total_area
+    return rows, total_count, total_area
 
 
-def create_summary_layer(rows):
+def create_summary_layer(rows, total_count, total_area, add_to_project=True):
     layer = QgsVectorLayer(
         "None",
         "사업지역_지목별_면적",
@@ -384,14 +398,36 @@ def create_summary_layer(rows):
         )
         features.append(feature)
 
+    total_feature = QgsFeature(layer.fields())
+    total_feature.setAttributes(
+        [
+            len(rows) + 1,
+            "합계",
+            total_count,
+            round(total_area, 2),
+            round(total_area / 10000.0, 4),
+            100.0,
+        ]
+    )
+    features.append(total_feature)
+
     provider.addFeatures(features)
     layer.updateExtents()
-    QgsProject.instance().addMapLayer(layer)
+
+    if add_to_project:
+        QgsProject.instance().addMapLayer(layer)
 
     return layer
 
 
-def export_summary_xlsx(summary_layer, output_path):
+def export_summary_xlsx(
+    summary_layer,
+    output_path,
+    rows,
+    total_count,
+    total_area,
+    report_style=True,
+):
     if not output_path.lower().endswith(".xlsx"):
         output_path += ".xlsx"
 
@@ -411,7 +447,6 @@ def export_summary_xlsx(summary_layer, output_path):
     )
 
     error_code = result[0] if isinstance(result, tuple) else result
-
     if error_code != QgsVectorFileWriter.NoError:
         error_message = (
             result[1]
@@ -422,14 +457,152 @@ def export_summary_xlsx(summary_layer, output_path):
             "Excel 파일 저장에 실패했습니다. %s" % error_message
         )
 
+    if report_style:
+        try:
+            _format_excel_report(
+                output_path,
+                rows,
+                total_count,
+                total_area,
+            )
+        except ImportError:
+            pass
+
     return output_path
+
+
+def _format_excel_report(
+    output_path,
+    rows,
+    total_count,
+    total_area,
+):
+    from openpyxl import load_workbook
+    from openpyxl.styles import (
+        Alignment,
+        Border,
+        Font,
+        PatternFill,
+        Side,
+    )
+
+    workbook = load_workbook(output_path)
+    worksheet = workbook.active
+    worksheet.title = "지목별면적"
+
+    worksheet.insert_rows(1, amount=2)
+    worksheet.merge_cells("A1:F1")
+    worksheet["A1"] = "사업지역 지목별 면적현황"
+    worksheet["A1"].font = Font(bold=True, size=14)
+    worksheet["A1"].alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+    )
+
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="D9E2F3",
+    )
+    total_fill = PatternFill(
+        fill_type="solid",
+        fgColor="E2F0D9",
+    )
+    thin = Side(style="thin", color="808080")
+    border = Border(
+        left=thin,
+        right=thin,
+        top=thin,
+        bottom=thin,
+    )
+
+    for cell in worksheet[3]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = border
+
+    max_row = worksheet.max_row
+    for row in worksheet.iter_rows(
+        min_row=4,
+        max_row=max_row,
+        min_col=1,
+        max_col=6,
+    ):
+        for cell in row:
+            cell.border = border
+
+    for row_index in range(4, max_row + 1):
+        worksheet.cell(row=row_index, column=3).number_format = "#,##0"
+        worksheet.cell(row=row_index, column=4).number_format = "#,##0.00"
+        worksheet.cell(row=row_index, column=5).number_format = "0.0000"
+        worksheet.cell(row=row_index, column=6).number_format = "0.00"
+
+    total_row = max_row
+    for cell in worksheet[total_row]:
+        cell.font = Font(bold=True)
+        cell.fill = total_fill
+
+    widths = {
+        "A": 10,
+        "B": 16,
+        "C": 12,
+        "D": 18,
+        "E": 14,
+        "F": 14,
+    }
+    for column, width in widths.items():
+        worksheet.column_dimensions[column].width = width
+
+    worksheet.freeze_panes = "A4"
+    worksheet.sheet_view.showGridLines = False
+
+    workbook.save(output_path)
+
+
+def format_chat_table(rows, total_count, total_area):
+    lines = [
+        "",
+        "사업지역 지목별 면적현황",
+        "----------------------------------------------",
+        "지목 | 필지수 | 면적(㎡) | 면적(ha) | 구성비(%)",
+        "----------------------------------------------",
+    ]
+
+    for row in rows:
+        lines.append(
+            "%s | %s | %s | %.4f | %.2f"
+            % (
+                row["지목"],
+                format(row["필지수"], ","),
+                format(round(row["면적_m2"], 2), ",.2f"),
+                row["면적_ha"],
+                row["구성비_pct"],
+            )
+        )
+
+    lines.extend(
+        [
+            "----------------------------------------------",
+            "합계 | %s | %s | %.4f | 100.00"
+            % (
+                format(total_count, ","),
+                format(round(total_area, 2), ",.2f"),
+                total_area / 10000.0,
+            ),
+            "",
+        ]
+    )
+    return lines
 
 
 def run_cadastral_area_analysis(
     iface,
-    output_path,
+    output_path=None,
+    options=None,
     log_callback=None,
 ):
+    options = options or {}
+
     _log(
         log_callback,
         "사업지역 및 연속지적도 레이어를 찾는 중입니다...",
@@ -443,24 +616,35 @@ def run_cadastral_area_analysis(
     clipped = clip_cadastral(
         business,
         cadastral,
-        log_callback,
+        selected_only=options.get("selected_only", False),
+        add_clip_layer=options.get("add_clip_layer", True),
+        log_callback=log_callback,
     )
 
-    rows, total_area = summarize_by_jimok(
+    rows, total_count, total_area = summarize_by_jimok(
         clipped,
         log_callback,
     )
 
-    summary_layer = create_summary_layer(rows)
-
-    _log(log_callback, "Excel 결과표를 저장하는 중입니다...")
-
-    saved_path = export_summary_xlsx(
-        summary_layer,
-        output_path,
+    summary_layer = create_summary_layer(
+        rows,
+        total_count,
+        total_area,
+        add_to_project=options.get("add_summary_layer", True),
     )
 
-    _log(log_callback, "Excel 저장 완료")
+    saved_path = None
+    if options.get("save_excel", True) and output_path:
+        _log(log_callback, "Excel 결과표를 저장하는 중입니다...")
+        saved_path = export_summary_xlsx(
+            summary_layer,
+            output_path,
+            rows,
+            total_count,
+            total_area,
+            report_style=options.get("report_style", True),
+        )
+        _log(log_callback, "Excel 저장 완료")
 
     return {
         "business_layer": business.name(),
@@ -468,6 +652,12 @@ def run_cadastral_area_analysis(
         "clipped_layer": clipped.name(),
         "summary_layer": summary_layer.name(),
         "category_count": len(rows),
+        "total_count": total_count,
         "total_area_m2": total_area,
         "output_path": saved_path,
+        "chat_lines": format_chat_table(
+            rows,
+            total_count,
+            total_area,
+        ),
     }
