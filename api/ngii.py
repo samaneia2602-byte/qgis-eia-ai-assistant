@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 
-import urllib.parse
+import os
 
-from qgis.core import (
-    QgsProject,
-    QgsRasterLayer,
-)
-
-from ..settings import SettingsStore
+from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
+from qgis.core import QgsProject, QgsRasterLayer
 
 
 class NgiiManager:
     """
-    국토지리정보원 국토정보플랫폼 OnMap 타일 레이어 로더.
+    국토지리정보원 온맵(GeoPDF) 로더.
 
-    현재는 국토정보플랫폼의 Gettile.do 형식 WMTS 타일 URL을
-    QGIS XYZ 레이어로 등록합니다.
+    '온맵 불러와줘' 명령을 실행하면 사용자가 내려받은
+    GeoPDF/PDF 파일을 선택하고 QGIS 래스터 레이어로 추가합니다.
+
+    이 기능은 로컬 파일을 여는 방식이므로 API Key를 사용하지 않습니다.
     """
 
     DEFAULT_LAYER_NAME = "국토지리정보원_온맵"
@@ -23,98 +21,93 @@ class NgiiManager:
     def __init__(self, iface, log):
         self.iface = iface
         self.log = log
-        self.store = SettingsStore()
 
     def load_onmap(self):
-        api_key = (self.store.ngii_key or "").strip()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self.iface.mainWindow(),
+            "국토지리정보원 온맵 GeoPDF 선택",
+            "",
+            "GeoPDF/PDF 파일 (*.pdf *.PDF);;모든 파일 (*.*)",
+        )
 
-        if not api_key:
-            self.log(
-                "오류: 국토지리정보원 API Key가 없습니다. "
-                "API Key 설정에서 먼저 저장하세요."
-            )
+        if not file_path:
+            self.log("온맵 불러오기가 취소되었습니다.")
             return None
 
-        # 국토지리정보원 타일 호출 형식.
-        # API 승인 문서에서 URL이 다르게 안내될 경우
-        # BASE_URL과 layer/style/tilematrixset 값만 조정하면 됩니다.
-        base_url = "https://map.ngii.go.kr/openapi/Gettile.do"
+        if not os.path.isfile(file_path):
+            self.log("오류: 선택한 온맵 파일을 찾을 수 없습니다.")
+            return None
 
-        query = {
-            "apikey": api_key,
-            "layer": "korean_map",
-            "style": "korean",
-            "tilematrixset": "korean",
-            "Service": "WMTS",
-            "Request": "GetTile",
-            "Version": "1.0.0",
-            "Format": "image/png",
-            "TileMatrix": "{z}",
-            "TileCol": "{x}",
-            "TileRow": "{y}",
-        }
+        layer_name = os.path.splitext(
+            os.path.basename(file_path)
+        )[0]
 
-        tile_url = (
-            base_url
-            + "?"
-            + urllib.parse.urlencode(
-                query,
-                safe="{}",
-            )
-        )
-
-        # QGIS XYZ provider URI
-        uri = (
-            "type=xyz"
-            "&url=%s"
-            "&zmin=0"
-            "&zmax=19"
-            "&crs=EPSG:3857"
-        ) % urllib.parse.quote(
-            tile_url,
-            safe=":/?&=%{}",
-        )
-
+        # GeoPDF는 GDAL PDF 드라이버를 통해 래스터로 불러옵니다.
         layer = QgsRasterLayer(
-            uri,
-            self.DEFAULT_LAYER_NAME,
-            "wms",
+            file_path,
+            layer_name or self.DEFAULT_LAYER_NAME,
+            "gdal",
         )
 
         if not layer.isValid():
             self.log(
-                "오류: 온맵 레이어를 생성하지 못했습니다. "
-                "API 승인 상태와 국토정보플랫폼의 타일 URL을 확인하세요."
+                "오류: 선택한 PDF를 GeoPDF 공간 레이어로 "
+                "불러오지 못했습니다."
             )
             self.log(
-                "참고: 승인 문서의 OnMap WMTS 호출 URL이 "
-                "현재 Gettile.do 형식과 다른 경우 URL 수정이 필요합니다."
+                "일반 PDF가 아니라 국토지리정보원에서 내려받은 "
+                "좌표정보 포함 GeoPDF인지 확인하세요."
+            )
+
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                "온맵 불러오기 실패",
+                "선택한 파일을 GeoPDF 레이어로 열 수 없습니다.\n\n"
+                "확인사항\n"
+                "1. 국토지리정보원 온맵 GeoPDF 파일인지\n"
+                "2. 파일이 손상되지 않았는지\n"
+                "3. QGIS/GDAL에서 PDF 드라이버를 지원하는지",
             )
             return None
 
-        QgsProject.instance().addMapLayer(
-            layer,
-            False,
-        )
+        project = QgsProject.instance()
+        project.addMapLayer(layer, False)
 
-        root = QgsProject.instance().layerTreeRoot()
+        # 배경지도 성격이므로 레이어 트리의 아래쪽에 배치합니다.
+        root = project.layerTreeRoot()
         root.insertLayer(
             len(root.children()),
             layer,
         )
 
-        self.log(
-            "국토지리정보원 온맵 레이어를 불러왔습니다."
+        crs_text = (
+            layer.crs().authid()
+            if layer.crs().isValid()
+            else "좌표계 정보 없음"
         )
 
-        active = self.iface.activeLayer()
-        if active and active.isValid():
-            try:
-                self.iface.mapCanvas().setExtent(
-                    active.extent()
-                )
+        self.log(
+            "국토지리정보원 온맵 GeoPDF를 불러왔습니다."
+        )
+        self.log(
+            "파일: %s" % file_path
+        )
+        self.log(
+            "레이어 좌표계: %s" % crs_text
+        )
+
+        try:
+            extent = layer.extent()
+            if not extent.isEmpty():
+                self.iface.mapCanvas().setExtent(extent)
                 self.iface.mapCanvas().refresh()
-            except Exception:
-                pass
+                self.log(
+                    "온맵 표시 범위로 지도를 이동했습니다."
+                )
+        except Exception as exc:
+            self.log(
+                "경고: 온맵 레이어는 추가되었지만 "
+                "자동 화면 이동에 실패했습니다: %s" % exc
+            )
 
         return layer
