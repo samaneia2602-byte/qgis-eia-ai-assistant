@@ -17,13 +17,10 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsRectangle,
-    QgsCategorizedSymbolRenderer,
     QgsFeature,
     QgsField,
-    QgsFillSymbol,
     QgsProject,
     QgsRasterLayer,
-    QgsRendererCategory,
     QgsVectorLayer,
     QgsWkbTypes,
 )
@@ -35,6 +32,7 @@ from .geometry import (
 )
 from .vworld import VWorldManager
 from ..settings import SettingsStore
+from ..symbology.eia_symbols import apply_ecology_style
 
 
 class ApiManager:
@@ -472,7 +470,7 @@ class ApiManager:
             layer.dataProvider().changeAttributeValues(changes)
             layer.updateFields()
 
-        self._apply_ecology_categorized_style(layer)
+        apply_ecology_style(layer, field_name="생태자연도")
         layer.triggerRepaint()
 
         self.log(
@@ -623,96 +621,6 @@ class ApiManager:
             return "3등급"
 
         return "미분류"
-
-    def _apply_ecology_categorized_style(self, layer):
-        """'생태자연도' 필드 기준의 자동 분류 심볼을 적용합니다."""
-        categories = []
-
-        grade1_symbol = QgsFillSymbol.createSimple(
-            {
-                "color": "#1ea725",
-                "outline_color": "#1ea725",
-                "outline_width": "0.20",
-            }
-        )
-        categories.append(
-            QgsRendererCategory(
-                "1등급",
-                grade1_symbol,
-                "1등급",
-            )
-        )
-
-        grade2_symbol = QgsFillSymbol.createSimple(
-            {
-                "color": "#cfe3c9",
-                "outline_color": "#9ebc96",
-                "outline_width": "0.15",
-            }
-        )
-        categories.append(
-            QgsRendererCategory(
-                "2등급",
-                grade2_symbol,
-                "2등급",
-            )
-        )
-
-        # 3등급은 채우기와 외곽선을 모두 표시하지 않습니다.
-        grade3_symbol = QgsFillSymbol.createSimple(
-            {
-                "color": "0,0,0,0",
-                "outline_style": "no",
-            }
-        )
-        grade3_symbol.setOpacity(0.0)
-        categories.append(
-            QgsRendererCategory(
-                "3등급",
-                grade3_symbol,
-                "3등급",
-            )
-        )
-
-        # 별도관리지역은 사용자가 별도 색상을 지정하지 않아
-        # 구분 가능한 주황색 반투명 심볼을 기본 적용합니다.
-        special_symbol = QgsFillSymbol.createSimple(
-            {
-                "color": "#f4b183",
-                "outline_color": "#d97941",
-                "outline_width": "0.25",
-            }
-        )
-        special_symbol.setOpacity(0.70)
-        categories.append(
-            QgsRendererCategory(
-                "별도관리지역",
-                special_symbol,
-                "별도관리지역",
-            )
-        )
-
-        unclassified_symbol = QgsFillSymbol.createSimple(
-            {
-                "color": "0,0,0,0",
-                "outline_color": "#808080",
-                "outline_width": "0.15",
-                "outline_style": "dot",
-            }
-        )
-        categories.append(
-            QgsRendererCategory(
-                "미분류",
-                unclassified_symbol,
-                "미분류",
-            )
-        )
-
-        renderer = QgsCategorizedSymbolRenderer(
-            "생태자연도",
-            categories,
-        )
-        layer.setRenderer(renderer)
 
     def _build_ecology_grid(
         self,
