@@ -11,6 +11,7 @@ from ..analysis.ecology_stats import run_ecology_analysis
 from ..analysis.jimok import cleanup_jimok
 from ..analysis.workflow_engine import FullAnalysisWorkflow
 from ..api.api_manager import ApiManager
+from ..api.ngii import NgiiManager
 from ..ui.api_settings import ApiSettingsDialog
 from ..ui.cadastral_options_dialog import CadastralOptionsDialog
 
@@ -20,6 +21,7 @@ class CommandExecutor:
         self.iface = iface
         self.log = log
         self.api = ApiManager(iface, log)
+        self.ngii = NgiiManager(iface, log)
         self.workflow = FullAnalysisWorkflow(
             iface,
             log,
@@ -46,6 +48,9 @@ class CommandExecutor:
 
         if cmd == "ecology_analysis":
             return self.ecology_analysis()
+
+        if cmd == "onmap_load":
+            return self.ngii.load_onmap()
 
         if cmd == "jimok_cleanup":
             return self.jimok_cleanup()

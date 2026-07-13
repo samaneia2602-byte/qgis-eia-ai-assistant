@@ -27,7 +27,6 @@ def parse_command(text):
     ):
         return "full_analysis"
 
-    # 사업지역 생태자연도 분석 명령
     if (
         "생태자연도" in t
         and "분석" in t
@@ -38,6 +37,23 @@ def parse_command(text):
         )
     ):
         return "ecology_analysis"
+
+    # 국토지리정보원 OnMap 명령
+    if (
+        (
+            "온맵" in t
+            or "onmap" in t
+            or "국토지리정보원지도" in t
+            or "국토정보플랫폼지도" in t
+        )
+        and (
+            "불러" in t
+            or "가져" in t
+            or "추가" in t
+            or "열어" in t
+        )
+    ):
+        return "onmap_load"
 
     if (
         "지목" in t
