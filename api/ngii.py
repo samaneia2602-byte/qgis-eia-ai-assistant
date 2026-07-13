@@ -3,17 +3,17 @@
 import hashlib
 import os
 import tempfile
+import traceback
 
-from qgis.PyQt.QtWidgets import (
-    QFileDialog,
-    QMessageBox,
-)
+from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
 from qgis.core import (
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsProject,
     QgsRasterLayer,
     QgsRectangle,
+    QgsTask,
 )
 
 try:
@@ -24,32 +24,122 @@ except Exception:
     osr = None
 
 
+class OnMapPrepareTask(QgsTask):
+    """
+    GeoPDF 변환/자르기를 QGIS 메인 화면이 아닌 백그라운드에서 실행합니다.
+    """
+
+    def __init__(
+        self,
+        manager,
+        file_paths,
+        crop_map_only,
+    ):
+        super().__init__(
+            "국토지리정보원 온맵 준비",
+            QgsTask.CanCancel,
+        )
+        self.manager = manager
+        self.file_paths = list(file_paths)
+        self.crop_map_only = bool(crop_map_only)
+        self.results = []
+        self.error_text = ""
+
+    def run(self):
+        try:
+            total = max(len(self.file_paths), 1)
+
+            for index, file_path in enumerate(
+                self.file_paths,
+                start=1,
+            ):
+                if self.isCanceled():
+                    return False
+
+                self.setProgress(
+                    (index - 1) / float(total) * 100.0
+                )
+
+                result = {
+                    "source_path": file_path,
+                    "prepared_path": file_path,
+                    "embedded_authid": "",
+                    "projection_wkt": "",
+                    "geotransform": None,
+                    "cropped": False,
+                    "error": "",
+                }
+
+                try:
+                    (
+                        prepared_path,
+                        embedded_authid,
+                        projection_wkt,
+                        geotransform,
+                        cropped,
+                    ) = self.manager._prepare_geopdf_worker(
+                        file_path,
+                        self.crop_map_only,
+                    )
+
+                    result.update(
+                        {
+                            "prepared_path": prepared_path,
+                            "embedded_authid": embedded_authid,
+                            "projection_wkt": projection_wkt,
+                            "geotransform": geotransform,
+                            "cropped": cropped,
+                        }
+                    )
+                except Exception as exc:
+                    # 변환 실패 시 원본 PDF 직접 열기를 시도하도록 결과에 남깁니다.
+                    result["error"] = str(exc)
+
+                self.results.append(result)
+                self.setProgress(
+                    index / float(total) * 100.0
+                )
+
+            return True
+
+        except Exception:
+            self.error_text = traceback.format_exc()
+            return False
+
+    def finished(self, success):
+        self.manager._on_prepare_finished(
+            self,
+            success,
+        )
+
+
 class NgiiManager:
     """
     국토지리정보원 온맵 GeoPDF 로더.
 
-    개선 기능
-    1. 여러 GeoPDF 동시 선택
-    2. GeoPDF의 NEATLINE을 이용해 지도 본문만 GeoTIFF로 추출
-    3. 포함 좌표계를 우선 사용하고, 잘못된 EPSG:3857 등은
-       현재 사업지역 위치와 비교하여 한국 좌표계 후보 중 자동 보정
-    4. 모든 온맵을 하나의 그룹 아래에 정리
+    핵심 개선:
+    - 여러 파일 동시 선택
+    - GeoPDF 변환/NEATLINE 자르기를 QgsTask 백그라운드에서 실행
+    - QGIS '응답 없음' 방지
+    - 작업 완료 후 메인 스레드에서 레이어 추가
     """
 
     GROUP_NAME = "국토지리정보원 온맵"
-    CRS_CANDIDATES = (
-        "EPSG:5179",
-        "EPSG:5186",
-        "EPSG:5187",
-        "EPSG:5185",
-        "EPSG:5181",
-        "EPSG:4326",
-        "EPSG:3857",
+
+    # Acrobat에서 기본적으로 끄는 온맵 선택 레이어.
+    # GDAL PDF 드라이버의 LAYERS_OFF 옵션으로 동일하게 처리합니다.
+    DEFAULT_PDF_LAYERS_OFF = (
+        "기본",
+        "항공영상",
+        "경계",
+        "주기",
+        "도곽",
     )
 
     def __init__(self, iface, log):
         self.iface = iface
         self.log = log
+        self._tasks = []
 
     def load_onmap(self):
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -61,23 +151,109 @@ class NgiiManager:
 
         if not file_paths:
             self.log("온맵 불러오기가 취소되었습니다.")
-            return []
+            return None
 
         crop_answer = QMessageBox.question(
             self.iface.mainWindow(),
             "온맵 지도부분만 추출",
             "PDF의 제목란·범례·여백을 제외하고\n"
             "좌표가 지정된 지도 부분만 추출할까요?\n\n"
-            "GeoPDF에 지도 경계(NEATLINE)가 들어 있으면 "
-            "자동으로 잘라냅니다.",
+            "파일이 크면 처리에 시간이 걸리지만 "
+            "QGIS 화면은 멈추지 않습니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
-        crop_map_only = crop_answer == QMessageBox.Yes
 
+        crop_map_only = (
+            crop_answer == QMessageBox.Yes
+        )
+
+        self.log(
+            "온맵 PDF 레이어 숨김: 기본, 항공영상, 경계, 주기, 도곽"
+        )
+
+        if gdal is None:
+            self.log(
+                "경고: GDAL Python 모듈을 찾지 못해 "
+                "원본 GeoPDF를 직접 불러옵니다."
+            )
+            return self._add_layers_from_results(
+                [
+                    {
+                        "source_path": path,
+                        "prepared_path": path,
+                        "embedded_authid": "",
+                        "projection_wkt": "",
+                        "geotransform": None,
+                        "cropped": False,
+                        "error": "",
+                    }
+                    for path in file_paths
+                ]
+            )
+
+        task = OnMapPrepareTask(
+            self,
+            file_paths,
+            crop_map_only,
+        )
+        self._tasks.append(task)
+
+        QgsApplication.taskManager().addTask(task)
+
+        self.log(
+            "온맵 %s개를 백그라운드에서 준비합니다."
+            % len(file_paths)
+        )
+        self.log(
+            "오른쪽 아래 작업 진행률에서 상태를 확인할 수 있습니다."
+        )
+
+        return task
+
+    def _on_prepare_finished(
+        self,
+        task,
+        success,
+    ):
+        try:
+            if task in self._tasks:
+                self._tasks.remove(task)
+
+            if task.isCanceled():
+                self.log(
+                    "온맵 불러오기 작업이 취소되었습니다."
+                )
+                return
+
+            if not success:
+                self.log(
+                    "오류: 온맵 백그라운드 작업에 실패했습니다."
+                )
+                if task.error_text:
+                    self.log(task.error_text)
+                return
+
+            self._add_layers_from_results(
+                task.results
+            )
+
+        except Exception as exc:
+            self.log(
+                "오류: 온맵 레이어 추가 중 문제가 발생했습니다: %s"
+                % exc
+            )
+
+    def _add_layers_from_results(
+        self,
+        results,
+    ):
         project = QgsProject.instance()
         root = project.layerTreeRoot()
-        group = root.findGroup(self.GROUP_NAME)
+
+        group = root.findGroup(
+            self.GROUP_NAME
+        )
         if group is None:
             group = root.insertGroup(
                 len(root.children()),
@@ -87,42 +263,19 @@ class NgiiManager:
         loaded_layers = []
         failed_files = []
 
-        for index, file_path in enumerate(file_paths, start=1):
-            if not os.path.isfile(file_path):
-                failed_files.append(file_path)
-                self.log(
-                    "[%s/%s] 파일을 찾을 수 없습니다: %s"
-                    % (index, len(file_paths), file_path)
-                )
-                continue
+        for result in results:
+            source_path = result["source_path"]
+            prepared_path = result["prepared_path"]
 
-            self.log(
-                "[%s/%s] 온맵 처리 시작: %s"
-                % (
-                    index,
-                    len(file_paths),
-                    os.path.basename(file_path),
-                )
-            )
-
-            try:
-                prepared_path, embedded_authid, cropped = (
-                    self._prepare_geopdf(
-                        file_path,
-                        crop_map_only,
-                    )
-                )
-            except Exception as exc:
-                prepared_path = file_path
-                embedded_authid = ""
-                cropped = False
+            if result.get("error"):
                 self.log(
-                    "경고: 지도부분 추출에 실패하여 "
-                    "원본 PDF를 직접 엽니다: %s" % exc
+                    "참고: 지도부분 추출에 실패하여 "
+                    "원본 PDF를 직접 엽니다: %s"
+                    % result["error"]
                 )
 
             layer_name = os.path.splitext(
-                os.path.basename(file_path)
+                os.path.basename(source_path)
             )[0]
 
             layer = QgsRasterLayer(
@@ -132,20 +285,35 @@ class NgiiManager:
             )
 
             if not layer.isValid():
-                failed_files.append(file_path)
+                # 변환본이 잘못되었을 때 원본을 한 번 더 시도합니다.
+                if prepared_path != source_path:
+                    layer = QgsRasterLayer(
+                        source_path,
+                        layer_name,
+                        "gdal",
+                    )
+
+            if not layer.isValid():
+                failed_files.append(
+                    source_path
+                )
                 self.log(
                     "오류: GeoPDF를 공간 레이어로 "
                     "불러오지 못했습니다: %s"
-                    % file_path
+                    % source_path
                 )
                 continue
 
-            corrected_crs = self._correct_layer_crs(
+            corrected_crs = self._apply_exact_georeferencing(
                 layer,
-                embedded_authid,
+                result.get("projection_wkt", ""),
+                result.get("embedded_authid", ""),
             )
 
-            project.addMapLayer(layer, False)
+            project.addMapLayer(
+                layer,
+                False,
+            )
             group.insertLayer(
                 len(group.children()),
                 layer,
@@ -157,12 +325,18 @@ class NgiiManager:
                 % (
                     layer_name,
                     corrected_crs or "미지정",
-                    "예" if cropped else "아니오",
+                    (
+                        "예"
+                        if result.get("cropped")
+                        else "아니오"
+                    ),
                 )
             )
 
         if loaded_layers:
-            self._zoom_to_layers(loaded_layers)
+            self._zoom_to_layers(
+                loaded_layers
+            )
             self.log(
                 "온맵 %s개를 불러왔습니다."
                 % len(loaded_layers)
@@ -172,37 +346,33 @@ class NgiiManager:
             QMessageBox.warning(
                 self.iface.mainWindow(),
                 "일부 온맵 불러오기 실패",
-                "선택한 %s개 파일 중 %s개를 불러왔고, "
-                "%s개는 실패했습니다.\n\n"
-                "실패한 파일은 플러그인 로그를 확인하세요."
-                % (
-                    len(file_paths),
-                    len(loaded_layers),
-                    len(failed_files),
-                ),
+                "%s개 파일을 불러오지 못했습니다.\n"
+                "대화창 로그에서 실패한 파일을 확인하세요."
+                % len(failed_files),
             )
 
         return loaded_layers
 
-    def _prepare_geopdf(
+    def _prepare_geopdf_worker(
         self,
         file_path,
         crop_map_only,
     ):
-        """
-        GeoPDF를 임시 GeoTIFF로 변환합니다.
-
-        NEATLINE이 있으면 지도 본문만 잘라내며,
-        없으면 전체 페이지를 GeoTIFF로 변환합니다.
-        """
-        if gdal is None:
+        if not os.path.isfile(file_path):
             raise RuntimeError(
-                "QGIS Python에서 GDAL 모듈을 사용할 수 없습니다."
+                "파일을 찾을 수 없습니다."
             )
+
+        open_options = [
+            "LAYERS_OFF=%s"
+            % ",".join(self.DEFAULT_PDF_LAYERS_OFF),
+            "RENDERING_OPTIONS=RASTER,VECTOR,TEXT",
+        ]
 
         dataset = gdal.OpenEx(
             file_path,
             gdal.OF_RASTER,
+            open_options=open_options,
         )
         if dataset is None:
             raise RuntimeError(
@@ -210,24 +380,51 @@ class NgiiManager:
             )
 
         projection_wkt = dataset.GetProjection() or ""
+        geotransform = dataset.GetGeoTransform(
+            can_return_null=True
+        )
         embedded_authid = self._authid_from_wkt(
             projection_wkt
         )
         neatline = dataset.GetMetadataItem("NEATLINE")
+
+        layer_metadata = dataset.GetMetadata("LAYERS") or {}
+        if layer_metadata:
+            available_layers = []
+            for key in sorted(layer_metadata):
+                if key.endswith("_NAME"):
+                    available_layers.append(
+                        layer_metadata[key]
+                    )
+            if available_layers:
+                self.log(
+                    "GeoPDF 포함 레이어: %s"
+                    % ", ".join(available_layers)
+                )
 
         cache_dir = os.path.join(
             tempfile.gettempdir(),
             "qgis_eia_ai_assistant",
             "onmap",
         )
-        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(
+            cache_dir,
+            exist_ok=True,
+        )
 
         fingerprint = hashlib.sha1(
             (
                 os.path.abspath(file_path)
-                + str(os.path.getmtime(file_path))
+                + str(
+                    os.path.getmtime(
+                        file_path
+                    )
+                )
                 + str(crop_map_only)
-            ).encode("utf-8", errors="replace")
+            ).encode(
+                "utf-8",
+                errors="replace",
+            )
         ).hexdigest()[:12]
 
         output_path = os.path.join(
@@ -235,16 +432,21 @@ class NgiiManager:
             "%s_%s.tif"
             % (
                 os.path.splitext(
-                    os.path.basename(file_path)
+                    os.path.basename(
+                        file_path
+                    )
                 )[0],
                 fingerprint,
             ),
         )
 
         if os.path.exists(output_path):
+            dataset = None
             return (
                 output_path,
                 embedded_authid,
+                projection_wkt,
+                geotransform,
                 bool(crop_map_only and neatline),
             )
 
@@ -262,35 +464,47 @@ class NgiiManager:
             and ogr is not None
             and osr is not None
         ):
-            cutline_path = self._create_cutline(
-                neatline,
-                projection_wkt,
-                cache_dir,
-                fingerprint,
+            cutline_path = (
+                self._create_cutline_worker(
+                    neatline,
+                    projection_wkt,
+                    cache_dir,
+                    fingerprint,
+                )
             )
 
             warp_options = gdal.WarpOptions(
                 format="GTiff",
                 cutlineDSName=cutline_path,
                 cropToCutline=True,
-                dstSRS=projection_wkt or None,
                 multithread=True,
-                creationOptions=creation_options,
+                warpOptions=[
+                    "NUM_THREADS=ALL_CPUS"
+                ],
+                creationOptions=(
+                    creation_options
+                ),
             )
+
             result = gdal.Warp(
                 output_path,
                 dataset,
                 options=warp_options,
             )
-            cropped = result is not None
 
-            if result is not None:
-                result = None
+            cropped = (
+                result is not None
+            )
+            result = None
 
         if not cropped:
-            translate_options = gdal.TranslateOptions(
-                format="GTiff",
-                creationOptions=creation_options,
+            translate_options = (
+                gdal.TranslateOptions(
+                    format="GTiff",
+                    creationOptions=(
+                        creation_options
+                    ),
+                )
             )
             result = gdal.Translate(
                 output_path,
@@ -299,26 +513,60 @@ class NgiiManager:
             )
 
             if result is None:
+                dataset = None
                 raise RuntimeError(
-                    "GeoPDF를 GeoTIFF로 변환하지 못했습니다."
+                    "GeoPDF를 GeoTIFF로 "
+                    "변환하지 못했습니다."
                 )
+
             result = None
 
-            if crop_map_only and not neatline:
-                self.log(
-                    "참고: 이 PDF에는 NEATLINE 정보가 없어 "
-                    "지도부분 자동 자르기를 적용하지 못했습니다."
-                )
+        # 변환 결과의 좌표정보가 실제로 보존되었는지 검사합니다.
+        output_dataset = gdal.OpenEx(
+            output_path,
+            gdal.OF_RASTER,
+        )
+        if output_dataset is None:
+            dataset = None
+            raise RuntimeError(
+                "변환된 GeoTIFF를 다시 열지 못했습니다."
+            )
 
+        output_projection = (
+            output_dataset.GetProjection()
+            or ""
+        )
+        output_geotransform = (
+            output_dataset.GetGeoTransform(
+                can_return_null=True
+            )
+        )
+
+        if not output_projection and projection_wkt:
+            output_dataset.SetProjection(
+                projection_wkt
+            )
+
+        if (
+            output_geotransform is None
+            and geotransform is not None
+        ):
+            output_dataset.SetGeoTransform(
+                geotransform
+            )
+
+        output_dataset = None
         dataset = None
 
         return (
             output_path,
             embedded_authid,
+            projection_wkt,
+            geotransform,
             cropped,
         )
 
-    def _create_cutline(
+    def _create_cutline_worker(
         self,
         neatline_wkt,
         projection_wkt,
@@ -331,219 +579,183 @@ class NgiiManager:
             % fingerprint,
         )
 
-        driver = ogr.GetDriverByName("GeoJSON")
-        if os.path.exists(cutline_path):
-            driver.DeleteDataSource(cutline_path)
+        driver = ogr.GetDriverByName(
+            "GeoJSON"
+        )
 
-        data_source = driver.CreateDataSource(
+        if os.path.exists(
             cutline_path
+        ):
+            driver.DeleteDataSource(
+                cutline_path
+            )
+
+        data_source = (
+            driver.CreateDataSource(
+                cutline_path
+            )
         )
 
         spatial_ref = None
         if projection_wkt:
-            spatial_ref = osr.SpatialReference()
+            spatial_ref = (
+                osr.SpatialReference()
+            )
             spatial_ref.ImportFromWkt(
                 projection_wkt
             )
 
-        layer = data_source.CreateLayer(
-            "cutline",
-            spatial_ref,
-            ogr.wkbPolygon,
+        cutline_layer = (
+            data_source.CreateLayer(
+                "cutline",
+                spatial_ref,
+                ogr.wkbPolygon,
+            )
         )
 
-        geometry = ogr.CreateGeometryFromWkt(
-            neatline_wkt
+        geometry = (
+            ogr.CreateGeometryFromWkt(
+                neatline_wkt
+            )
         )
         if geometry is None:
             data_source = None
             raise RuntimeError(
-                "GeoPDF NEATLINE을 해석하지 못했습니다."
+                "GeoPDF NEATLINE을 "
+                "해석하지 못했습니다."
             )
 
         feature = ogr.Feature(
-            layer.GetLayerDefn()
+            cutline_layer.GetLayerDefn()
         )
-        feature.SetGeometry(geometry)
-        layer.CreateFeature(feature)
+        feature.SetGeometry(
+            geometry
+        )
+        cutline_layer.CreateFeature(
+            feature
+        )
 
         feature = None
         data_source = None
+
         return cutline_path
 
-    def _authid_from_wkt(self, wkt):
+    def _authid_from_wkt(
+        self,
+        wkt,
+    ):
         if not wkt:
             return ""
 
         crs = QgsCoordinateReferenceSystem()
         if crs.createFromWkt(wkt):
             return crs.authid()
+
         return ""
 
-    def _correct_layer_crs(
+    def _apply_exact_georeferencing(
         self,
         layer,
+        projection_wkt,
         embedded_authid,
     ):
-        current_authid = (
-            layer.crs().authid()
-            if layer.crs().isValid()
-            else ""
-        )
+        """
+        GeoPDF/GDAL이 제공한 원본 좌표계 정의를 그대로 적용합니다.
 
-        extent = layer.extent()
-        suspicious = self._is_suspicious_crs(
-            current_authid,
-            extent,
-        )
+        이전 버전처럼 EPSG 후보를 추정하여 강제로 바꾸지 않습니다.
+        CRS 추정은 좌표가 맞는 자료까지 틀어지게 할 수 있으므로,
+        원본 WKT → 원본 EPSG → 레이어 자체 CRS 순서로만 사용합니다.
+        """
+        exact_crs = QgsCoordinateReferenceSystem()
 
-        if not suspicious:
-            return current_authid
-
-        reference_point = self._reference_point_wgs84()
-        best_authid = self._best_candidate_crs(
-            extent,
-            reference_point,
-        )
-
-        if not best_authid:
-            best_authid = (
-                embedded_authid
-                if embedded_authid
-                else "EPSG:5179"
-            )
-
-        corrected = QgsCoordinateReferenceSystem(
-            best_authid
-        )
-        if corrected.isValid():
-            self.log(
-                "온맵 좌표계 자동 보정: %s → %s"
-                % (
-                    current_authid or "미지정",
-                    best_authid,
-                )
-            )
-            layer.setCrs(corrected)
-            return best_authid
-
-        return current_authid
-
-    def _is_suspicious_crs(
-        self,
-        authid,
-        extent,
-    ):
-        if not authid:
-            return True
-
-        # 한국의 Web Mercator 좌표는 대략
-        # X=13~15백만, Y=3~5백만 범위입니다.
-        if authid == "EPSG:3857":
-            center = extent.center()
-            if (
-                abs(center.x()) < 5000000
-                or abs(center.y()) < 2000000
-            ):
-                return True
-
-        return False
-
-    def _reference_point_wgs84(self):
-        reference_layer = self.iface.activeLayer()
-        if (
-            reference_layer is None
-            or not reference_layer.isValid()
-            or not reference_layer.crs().isValid()
-        ):
-            return None
-
-        try:
-            center = reference_layer.extent().center()
-            transform = QgsCoordinateTransform(
-                reference_layer.crs(),
-                QgsCoordinateReferenceSystem("EPSG:4326"),
-                QgsProject.instance().transformContext(),
-            )
-            return transform.transform(center)
-        except Exception:
-            return None
-
-    def _best_candidate_crs(
-        self,
-        extent,
-        reference_point,
-    ):
-        if reference_point is None:
-            return None
-
-        center = extent.center()
-        best_authid = None
-        best_distance = None
-
-        for authid in self.CRS_CANDIDATES:
-            candidate = QgsCoordinateReferenceSystem(
-                authid
-            )
-            if not candidate.isValid():
-                continue
-
+        if projection_wkt:
             try:
-                transform = QgsCoordinateTransform(
-                    candidate,
-                    QgsCoordinateReferenceSystem(
-                        "EPSG:4326"
-                    ),
-                    QgsProject.instance().transformContext(),
-                )
-                transformed = transform.transform(
-                    center
+                exact_crs.createFromWkt(
+                    projection_wkt
                 )
             except Exception:
-                continue
+                pass
 
-            # 한국 영역 밖 후보는 제외합니다.
-            if not (
-                123.0 <= transformed.x() <= 133.5
-                and 32.0 <= transformed.y() <= 40.5
-            ):
-                continue
-
-            distance = (
-                abs(
-                    transformed.x()
-                    - reference_point.x()
-                )
-                + abs(
-                    transformed.y()
-                    - reference_point.y()
-                )
+        if (
+            not exact_crs.isValid()
+            and embedded_authid
+        ):
+            exact_crs = QgsCoordinateReferenceSystem(
+                embedded_authid
             )
 
-            if (
-                best_distance is None
-                or distance < best_distance
-            ):
-                best_distance = distance
-                best_authid = authid
+        if exact_crs.isValid():
+            current_authid = (
+                layer.crs().authid()
+                if layer.crs().isValid()
+                else "미지정"
+            )
 
-        return best_authid
+            layer.setCrs(exact_crs)
 
-    def _zoom_to_layers(self, layers):
+            exact_name = (
+                exact_crs.authid()
+                or exact_crs.description()
+                or "원본 WKT 좌표계"
+            )
+
+            if current_authid != exact_crs.authid():
+                self.log(
+                    "온맵 원본 좌표계 적용: %s → %s"
+                    % (
+                        current_authid,
+                        exact_name,
+                    )
+                )
+
+            return exact_name
+
+        if layer.crs().isValid():
+            return (
+                layer.crs().authid()
+                or layer.crs().description()
+            )
+
+        self.log(
+            "경고: GeoPDF에서 유효한 좌표계를 읽지 못했습니다."
+        )
+        return "미지정"
+
+    def _zoom_to_layers(
+        self,
+        layers,
+    ):
         combined = None
+        canvas_crs = (
+            self.iface.mapCanvas()
+            .mapSettings()
+            .destinationCrs()
+        )
 
         for layer in layers:
             try:
-                layer_extent = layer.extent()
+                layer_extent = (
+                    layer.extent()
+                )
 
-                if layer.crs() != self.iface.mapCanvas().mapSettings().destinationCrs():
-                    transform = QgsCoordinateTransform(
-                        layer.crs(),
-                        self.iface.mapCanvas().mapSettings().destinationCrs(),
-                        QgsProject.instance().transformContext(),
+                if (
+                    layer.crs().isValid()
+                    and layer.crs()
+                    != canvas_crs
+                ):
+                    transform = (
+                        QgsCoordinateTransform(
+                            layer.crs(),
+                            canvas_crs,
+                            QgsProject.instance()
+                            .transformContext(),
+                        )
                     )
-                    layer_extent = transform.transformBoundingBox(
-                        layer_extent
+                    layer_extent = (
+                        transform
+                        .transformBoundingBox(
+                            layer_extent
+                        )
                     )
 
                 if combined is None:
@@ -554,13 +766,18 @@ class NgiiManager:
                     combined.combineExtentWith(
                         layer_extent
                     )
+
             except Exception as exc:
                 self.log(
-                    "경고: 온맵 화면 범위 계산 실패: %s"
+                    "경고: 온맵 화면 범위 "
+                    "계산 실패: %s"
                     % exc
                 )
 
-        if combined and not combined.isEmpty():
+        if (
+            combined is not None
+            and not combined.isEmpty()
+        ):
             self.iface.mapCanvas().setExtent(
                 combined
             )
