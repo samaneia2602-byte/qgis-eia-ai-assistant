@@ -7,6 +7,7 @@ from qgis.core import QgsProject, QgsRectangle, QgsVectorLayer
 
 from .parser import parse_command
 from ..analysis.cadastral_stats import run_cadastral_area_analysis
+from ..analysis.ecology_stats import run_ecology_analysis
 from ..analysis.jimok import cleanup_jimok
 from ..analysis.workflow_engine import FullAnalysisWorkflow
 from ..api.api_manager import ApiManager
@@ -42,6 +43,9 @@ class CommandExecutor:
 
         if cmd == "full_analysis":
             return self.full_analysis()
+
+        if cmd == "ecology_analysis":
+            return self.ecology_analysis()
 
         if cmd == "jimok_cleanup":
             return self.jimok_cleanup()
@@ -93,14 +97,95 @@ class CommandExecutor:
         else:
             self.log("오류: 파일을 열 수 없습니다.")
 
+    def ecology_analysis(self):
+        dialog = CadastralOptionsDialog(
+            self.iface.mainWindow()
+        )
+        dialog.setWindowTitle(
+            "사업지역 생태자연도 분석"
+        )
+
+        if not dialog.exec_():
+            self.log(
+                "사업지역 생태자연도 분석을 취소했습니다."
+            )
+            return
+
+        options = dialog.options()
+        output_path = None
+
+        if options.get("save_excel", True):
+            output_path, _ = QFileDialog.getSaveFileName(
+                self.iface.mainWindow(),
+                "생태자연도 분석보고서 저장",
+                "사업지역_생태자연도_분석보고서.xlsx",
+                "Excel 통합문서 (*.xlsx)",
+            )
+
+            if not output_path:
+                self.log(
+                    "보고서 저장 위치를 선택하지 않아 "
+                    "분석을 취소했습니다."
+                )
+                return
+
+        self.log("=" * 48)
+        self.log(
+            "사업지역 생태자연도 분석을 시작합니다."
+        )
+        self.log("=" * 48)
+
+        try:
+            result = run_ecology_analysis(
+                self.iface,
+                self.api,
+                output_path=output_path,
+                options=options,
+                log_callback=self.log,
+            )
+        except Exception as exc:
+            self.log(
+                "오류: 사업지역 생태자연도 분석에 실패했습니다."
+            )
+            self.log(str(exc))
+            return
+
+        if options.get("show_chat_table", True):
+            for line in result.get(
+                "chat_lines",
+                [],
+            ):
+                self.log(line)
+
+        self.log(
+            "생태자연도 분석 완료: "
+            "%s개 등급, 총면적 %.2f㎡"
+            % (
+                result["category_count"],
+                result["total_area_m2"],
+            )
+        )
+
+        if result.get("output_path"):
+            self.log(
+                "Excel 저장: %s"
+                % result["output_path"]
+            )
+
+        return result
+
     def full_analysis(self):
         dialog = CadastralOptionsDialog(
             self.iface.mainWindow()
         )
-        dialog.setWindowTitle("사업지역 종합분석")
+        dialog.setWindowTitle(
+            "사업지역 종합분석"
+        )
 
         if not dialog.exec_():
-            self.log("사업지역 종합분석을 취소했습니다.")
+            self.log(
+                "사업지역 종합분석을 취소했습니다."
+            )
             return
 
         options = dialog.options()
@@ -122,7 +207,9 @@ class CommandExecutor:
                 return
 
         self.log("=" * 48)
-        self.log("사업지역 종합분석을 시작합니다.")
+        self.log(
+            "사업지역 종합분석을 시작합니다."
+        )
         self.log("=" * 48)
 
         try:
@@ -131,7 +218,9 @@ class CommandExecutor:
                 options=options,
             )
         except Exception as exc:
-            self.log("오류: 사업지역 종합분석에 실패했습니다.")
+            self.log(
+                "오류: 사업지역 종합분석에 실패했습니다."
+            )
             self.log(str(exc))
             return None
 
@@ -187,7 +276,9 @@ class CommandExecutor:
         layer = self.iface.activeLayer()
 
         if not layer:
-            self.log("오류: 현재 선택된 레이어가 없습니다.")
+            self.log(
+                "오류: 현재 선택된 레이어가 없습니다."
+            )
             return
 
         result = cleanup_jimok(
@@ -216,7 +307,9 @@ class CommandExecutor:
         )
 
         if not dialog.exec_():
-            self.log("지목별 면적 산출을 취소했습니다.")
+            self.log(
+                "지목별 면적 산출을 취소했습니다."
+            )
             return
 
         options = dialog.options()
@@ -237,7 +330,9 @@ class CommandExecutor:
                 )
                 return
 
-        self.log("지목별 면적 분석을 시작합니다.")
+        self.log(
+            "지목별 면적 분석을 시작합니다."
+        )
 
         try:
             result = run_cadastral_area_analysis(
@@ -247,12 +342,17 @@ class CommandExecutor:
                 self.log,
             )
         except Exception as exc:
-            self.log("오류: 지목별 면적 산출에 실패했습니다.")
+            self.log(
+                "오류: 지목별 면적 산출에 실패했습니다."
+            )
             self.log(str(exc))
             return
 
         if options.get("show_chat_table", True):
-            for line in result.get("chat_lines", []):
+            for line in result.get(
+                "chat_lines",
+                [],
+            ):
                 self.log(line)
 
         self.log(
@@ -265,20 +365,30 @@ class CommandExecutor:
         )
 
         if result.get("output_path"):
-            self.log("Excel 저장: %s" % result["output_path"])
+            self.log(
+                "Excel 저장: %s"
+                % result["output_path"]
+            )
 
     def zoomout_10km(self):
         layer = self.iface.activeLayer()
 
         if not layer:
-            self.log("오류: 현재 선택된 레이어가 없습니다.")
+            self.log(
+                "오류: 현재 선택된 레이어가 없습니다."
+            )
             return
 
-        rect = QgsRectangle(layer.extent())
+        rect = QgsRectangle(
+            layer.extent()
+        )
         rect.grow(10000)
-        self.iface.mapCanvas().setExtent(rect)
+        self.iface.mapCanvas().setExtent(
+            rect
+        )
         self.iface.mapCanvas().refresh()
 
         self.log(
-            "선택 레이어 범위 기준 10km 줌아웃했습니다."
+            "선택 레이어 범위 기준 "
+            "10km 줌아웃했습니다."
         )
