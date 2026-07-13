@@ -51,7 +51,7 @@ class CommandExecutor:
             return
 
         if cmd == "cadastral_load":
-            return self.api.load_vworld_cadastral()
+            return self.load_cadastral_and_cleanup()
 
         if cmd == "cadastral_stats":
             return self.cadastral_stats()
@@ -84,6 +84,60 @@ class CommandExecutor:
         else:
             self.log("오류: 파일을 열 수 없습니다.")
 
+    def load_cadastral_and_cleanup(self):
+        """
+        VWorld 연속지적도를 불러온 뒤 같은 레이어에
+        '지목' 필드를 자동 생성·정리합니다.
+        """
+        layer = self.api.load_vworld_cadastral()
+
+        if not layer:
+            return None
+
+        self.log(
+            "연속지적도 불러오기가 완료되어 "
+            "'지목' 필드를 자동 정리합니다..."
+        )
+
+        try:
+            result = cleanup_jimok(
+                layer,
+                field_name="지목",
+            )
+        except Exception as exc:
+            self.log(
+                "경고: 연속지적도는 불러왔지만 "
+                "지목 필드 자동 정리에 실패했습니다."
+            )
+            self.log(str(exc))
+            return layer
+
+        if isinstance(result, dict):
+            updated = result.get("updated", 0)
+            unclassified = result.get("unclassified", 0)
+            self.log(
+                "연속지적도 및 지목 테이블 정리 완료: "
+                "변경 %s건, 미분류 %s건"
+                % (
+                    updated,
+                    unclassified,
+                )
+            )
+        else:
+            self.log(
+                "연속지적도 및 지목 테이블 정리 완료: "
+                "처리 %s건" % result
+            )
+
+        try:
+            self.iface.setActiveLayer(layer)
+            layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+        except Exception:
+            pass
+
+        return layer
+
     def jimok_cleanup(self):
         layer = self.iface.activeLayer()
 
@@ -91,7 +145,10 @@ class CommandExecutor:
             self.log("오류: 현재 선택된 레이어가 없습니다.")
             return
 
-        result = cleanup_jimok(layer)
+        result = cleanup_jimok(
+            layer,
+            field_name="지목",
+        )
 
         if isinstance(result, dict):
             self.log(
