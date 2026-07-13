@@ -10,6 +10,8 @@ from xml.etree import ElementTree
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsRectangle,
     QgsProject,
     QgsRasterLayer,
     QgsVectorLayer,
@@ -190,14 +192,14 @@ class ApiManager:
 
     def load_ecology_wfs(self):
         """
-        국립생태원 생태자연도 WFS REST API를 호출합니다.
+        국립생태원 생태자연도 WFS API를 기술문서 규격대로 호출합니다.
 
-        핵심 개선:
-        - 정확한 /wfs/getEcologyzmpWFS 경로 사용
-        - 저장 키가 Encoding 키여도 한 번 디코딩
-        - URL을 QgsVectorLayer로 직접 열지 않고 응답을 내려받아 검사
-        - GeoJSON/GML/XML 응답을 임시 파일로 저장한 뒤 OGR로 로드
-        - 서비스 오류 메시지를 대화창 로그에 표시
+        기술문서 기준:
+        - 서비스 경로: /B553084/ecoapi/EcologyzmpService/wfs/getEcologyzmpWFS
+        - typeName=tbl_opn_eczm
+        - bbox는 EPSG:5186 좌표값 사용
+        - maxFeatures 최대 500
+        - 응답은 GML/XML FeatureCollection
         """
         raw_key = (self.store.ecology_key or "").strip()
 
@@ -208,130 +210,86 @@ class ApiManager:
             )
             return None
 
-        # Encoding 키가 저장돼 있으면 먼저 Decoding 형태로 변환합니다.
-        service_key = urllib.parse.unquote(
-            raw_key
-        )
+        # 저장값이 Encoding 키든 Decoding 키든 URL 인코딩은 한 번만 적용합니다.
+        service_key = urllib.parse.unquote(raw_key)
 
-        extent, crs = active_or_selected_extent(
-            self.iface
-        )
-        e4326 = extent_to_epsg4326(
-            extent,
-            crs,
-        )
+        extent, source_crs = active_or_selected_extent(self.iface)
 
-        bbox = "%.8f,%.8f,%.8f,%.8f" % (
-            e4326.xMinimum(),
-            e4326.yMinimum(),
-            e4326.xMaximum(),
-            e4326.yMaximum(),
+        target_crs = QgsCoordinateReferenceSystem("EPSG:5186")
+        if not target_crs.isValid():
+            self.log("오류: EPSG:5186 좌표계를 생성하지 못했습니다.")
+            return None
+
+        try:
+            transform = QgsCoordinateTransform(
+                source_crs,
+                target_crs,
+                QgsProject.instance().transformContext(),
+            )
+            extent_5186 = transform.transformBoundingBox(extent)
+        except Exception as exc:
+            self.log(
+                "오류: 사업지역 범위를 EPSG:5186으로 변환하지 못했습니다: %s"
+                % exc
+            )
+            return None
+
+        # 기술문서 예시와 같이 minX,minY,maxX,maxY 순서
+        bbox = "%.4f,%.4f,%.4f,%.4f" % (
+            extent_5186.xMinimum(),
+            extent_5186.yMinimum(),
+            extent_5186.xMaximum(),
+            extent_5186.yMaximum(),
         )
 
         base = (
-            "https://apis.data.go.kr/B553084/"
-            "ecopias/EcologyzmpService/"
+            "http://apis.data.go.kr/B553084/"
+            "ecoapi/EcologyzmpService/"
             "wfs/getEcologyzmpWFS"
         )
 
-        # 기술문서 버전에 따라 파라미터 표기가 달라질 수 있어
-        # 가장 일반적인 두 조합을 순차적으로 시험합니다.
-        parameter_sets = [
-            {
-                "serviceKey": service_key,
-                "bbox": bbox,
-                "coordType": "EPSG:4326",
-                "resultType": "json",
-                "pageNo": 1,
-                "numOfRows": 1000,
-            },
-            {
-                "serviceKey": service_key,
-                "bbox": bbox,
-                "crs": "EPSG:4326",
-                "type": "json",
-                "pageNo": 1,
-                "numOfRows": 1000,
-            },
-            {
-                "serviceKey": service_key,
-                "service": "WFS",
-                "request": "GetFeature",
-                "version": "1.1.0",
-                "bbox": bbox,
-                "srsName": "EPSG:4326",
-                "outputFormat": "application/json",
-                "maxFeatures": 1000,
-            },
-            {
-                "serviceKey": service_key,
-                "minX": e4326.xMinimum(),
-                "minY": e4326.yMinimum(),
-                "maxX": e4326.xMaximum(),
-                "maxY": e4326.yMaximum(),
-                "coordType": "EPSG:4326",
-                "resultType": "json",
-                "pageNo": 1,
-                "numOfRows": 1000,
-            },
-        ]
+        params = {
+            "serviceKey": service_key,
+            "typeName": "tbl_opn_eczm",
+            "bbox": bbox,
+            "maxFeatures": 500,
+        }
 
         self.log(
-            "생태자연도 WFS BBOX EPSG:4326 = %s"
+            "생태자연도 WFS BBOX EPSG:5186 = %s"
             % bbox
         )
 
-        errors = []
+        try:
+            layer = self._request_ecology_vector(
+                base,
+                params,
+                attempt=1,
+            )
+        except Exception as exc:
+            self.log(
+                "생태자연도 WFS 호출 실패: %s"
+                % exc
+            )
+            return None
 
-        for index, params in enumerate(
-            parameter_sets,
-            start=1,
-        ):
-            try:
-                layer = self._request_ecology_vector(
-                    base,
-                    params,
-                    attempt=index,
-                )
-            except Exception as exc:
-                errors.append(str(exc))
-                self.log(
-                    "생태자연도 WFS 호출 %s차 실패: %s"
-                    % (
-                        index,
-                        exc,
-                    )
-                )
-                continue
+        if layer and layer.isValid():
+            layer.setName("생태자연도_WFS")
 
-            if layer and layer.isValid():
-                layer.setName(
-                    "생태자연도_WFS"
-                )
-                QgsProject.instance().addMapLayer(
-                    layer
-                )
-                self.log(
-                    "생태자연도 WFS 레이어를 추가했습니다: "
-                    "%s개 객체"
-                    % layer.featureCount()
-                )
-                return layer
+            if not layer.crs().isValid():
+                layer.setCrs(target_crs)
+
+            QgsProject.instance().addMapLayer(layer)
+            self.log(
+                "생태자연도 WFS 레이어를 추가했습니다: "
+                "%s개 객체"
+                % layer.featureCount()
+            )
+            return layer
 
         self.log(
             "오류: 생태자연도 WFS 응답을 "
             "벡터 레이어로 변환하지 못했습니다."
-        )
-
-        if errors:
-            self.log(
-                "마지막 오류: %s"
-                % errors[-1]
-            )
-
-        self.log(
-            "공공데이터포털 기술문서의 필수 파라미터명을 "
-            "확인해야 합니다."
         )
         return None
 
@@ -716,10 +674,7 @@ class ApiManager:
         return compact
 
     def load_ecology_wms(self):
-        key = (
-            self.store.ecology_key
-            or ""
-        ).strip()
+        key = (self.store.ecology_key or "").strip()
 
         if not key:
             self.log(
@@ -727,43 +682,51 @@ class ApiManager:
             )
             return None
 
-        service_key = urllib.parse.unquote(
-            key
-        )
+        service_key = urllib.parse.unquote(key)
 
-        extent, crs = active_or_selected_extent(
-            self.iface
-        )
-        e4326 = extent_to_epsg4326(
-            extent,
-            crs,
+        extent, source_crs = active_or_selected_extent(self.iface)
+        target_crs = QgsCoordinateReferenceSystem("EPSG:5186")
+
+        try:
+            transform = QgsCoordinateTransform(
+                source_crs,
+                target_crs,
+                QgsProject.instance().transformContext(),
+            )
+            extent_5186 = transform.transformBoundingBox(extent)
+        except Exception as exc:
+            self.log(
+                "오류: 생태자연도 WMS 범위 변환 실패: %s"
+                % exc
+            )
+            return None
+
+        bbox = "%.4f,%.4f,%.4f,%.4f" % (
+            extent_5186.xMinimum(),
+            extent_5186.yMinimum(),
+            extent_5186.xMaximum(),
+            extent_5186.yMaximum(),
         )
 
         base = (
-            "https://apis.data.go.kr/B553084/"
-            "ecopias/EcologyzmpService/"
+            "http://apis.data.go.kr/B553084/"
+            "ecoapi/EcologyzmpService/"
             "wms/getEcologyzmpWMS"
         )
         query = {
             "serviceKey": service_key,
-            "minx": e4326.xMinimum(),
-            "miny": e4326.yMinimum(),
-            "maxx": e4326.xMaximum(),
-            "maxy": e4326.yMaximum(),
-            "coordType": "EPSG:4326",
+            "layers": "tbl_opn_eczm",
+            "srs": "EPSG:5186",
+            "bbox": bbox,
             "width": 1024,
             "height": 1024,
-            "imgType": "png",
-            "background": "transparent",
+            "format": "png",
+            "transparent": "true",
+            "bgcolor": "0xFFFFFF",
+            "exceptions": "XML",
         }
 
-        url = (
-            base
-            + "?"
-            + urllib.parse.urlencode(
-                query
-            )
-        )
+        url = base + "?" + urllib.parse.urlencode(query)
 
         layer = QgsRasterLayer(
             url,
@@ -771,9 +734,7 @@ class ApiManager:
         )
 
         if layer.isValid():
-            QgsProject.instance().addMapLayer(
-                layer
-            )
+            QgsProject.instance().addMapLayer(layer)
             self.log(
                 "생태자연도 WMS 이미지를 추가했습니다."
             )
