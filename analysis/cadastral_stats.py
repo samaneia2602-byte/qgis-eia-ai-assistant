@@ -634,18 +634,18 @@ def run_cadastral_area_analysis(
     )
 
     saved_path = None
-    if options.get("save_excel", True) and output_path:
-        _log(log_callback, "Excel 결과표를 저장하는 중입니다...")
-        engine = build_cadastral_report(
-    rows=rows,
-    total_count=total_count,
-    total_area_m2=total_area,
-    business_layer_name=business.name(),
-    cadastral_layer_name=cadastral.name(),
-    project_name=business.name(),
+    engine = build_cadastral_report(
+        rows=rows,
+        total_count=total_count,
+        total_area_m2=total_area,
+        business_layer_name=business.name(),
+        cadastral_layer_name=cadastral.name(),
+        project_name=business.name(),
     )
 
-    saved_path = engine.export_excel(output_path)
+    if options.get("save_excel", True) and output_path:
+        _log(log_callback, "Excel 결과표를 저장하는 중입니다...")
+        saved_path = engine.export_excel(output_path)
         _log(log_callback, "Excel 저장 완료")
 
     return {
