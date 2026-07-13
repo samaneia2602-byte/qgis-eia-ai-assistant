@@ -169,30 +169,52 @@ def _resolve_grade_field(layer):
 
 
 def _normalize_grade(value):
+    """
+    생태자연도 등급값을 보고서용 표준 명칭으로 정리합니다.
+
+    예:
+    1, 01, 1등급, I  -> 1등급
+    2, 02, 2등급, II -> 2등급
+    3, 03, 3등급, III -> 3등급
+    별도, 별도관리, 별도관리지역 -> 별도관리지역
+    """
     text = str(value or "").strip()
 
     if not text:
         return "미분류"
 
-    compact = re.sub(r"\s+", "", text).lower()
+    compact = re.sub(r"[\s_\-]+", "", text).lower()
 
-    if "별도관리" in compact or "별도" == compact:
+    if (
+        "별도관리지역" in compact
+        or "별도관리" in compact
+        or compact in ("별도", "special", "separate")
+    ):
         return "별도관리지역"
 
-    if "1등급" in compact or compact in ("1", "01", "i"):
+    if (
+        "1등급" in compact
+        or compact in ("1", "01", "i", "grade1", "class1")
+    ):
         return "1등급"
 
-    if "2등급" in compact or compact in ("2", "02", "ii"):
+    if (
+        "2등급" in compact
+        or compact in ("2", "02", "ii", "grade2", "class2")
+    ):
         return "2등급"
 
-    if "3등급" in compact or compact in ("3", "03", "iii"):
+    if (
+        "3등급" in compact
+        or compact in ("3", "03", "iii", "grade3", "class3")
+    ):
         return "3등급"
 
-    match = re.search(r"([123])", compact)
+    match = re.search(r"(?<!\d)([123])(?!\d)", compact)
     if match:
         return "%s등급" % match.group(1)
 
-    return text if len(text) <= 30 else "미분류"
+    return "미분류"
 
 
 def clip_ecology(
@@ -280,12 +302,8 @@ def summarize_ecology(clipped_layer, log_callback=None):
         if not geometry or geometry.isEmpty():
             continue
 
-        grade = _normalize_grade(
-            feature[grade_field]
-        )
-        area_m2 = abs(
-            distance.measureArea(geometry)
-        )
+        grade = _normalize_grade(feature[grade_field])
+        area_m2 = abs(distance.measureArea(geometry))
 
         if area_m2 > 0:
             summary[grade] += area_m2
@@ -297,22 +315,16 @@ def summarize_ecology(clipped_layer, log_callback=None):
 
     total_area = sum(summary.values())
 
-    grade_order = {
-        "1등급": 1,
-        "2등급": 2,
-        "3등급": 3,
-        "별도관리지역": 4,
-        "미분류": 99,
-    }
+    standard_grades = (
+        "1등급",
+        "2등급",
+        "3등급",
+        "별도관리지역",
+    )
 
     rows = []
-    for grade, area_m2 in sorted(
-        summary.items(),
-        key=lambda item: (
-            grade_order.get(item[0], 50),
-            -item[1],
-        ),
-    ):
+    for grade in standard_grades:
+        area_m2 = summary.get(grade, 0.0)
         rows.append(
             {
                 "등급": grade,
@@ -325,6 +337,26 @@ def summarize_ecology(clipped_layer, log_callback=None):
             }
         )
 
+    unclassified_area = summary.get("미분류", 0.0)
+    if unclassified_area > 0:
+        rows.append(
+            {
+                "등급": "미분류",
+                "면적_m2": unclassified_area,
+                "면적_ha": unclassified_area / 10000.0,
+                "구성비_pct": (
+                    unclassified_area / total_area * 100.0
+                    if total_area else 0.0
+                ),
+            }
+        )
+
+    _log(
+        log_callback,
+        "생태자연도 등급 표준화 완료: "
+        "1등급·2등급·3등급·별도관리지역",
+    )
+
     return rows, total_area
 
 
@@ -333,9 +365,13 @@ def create_summary_layer(
     total_area,
     add_to_project=True,
 ):
+    """
+    속성테이블 구조:
+    순번 | 생태자연도 | 면적_m2 | 면적_ha | 구성비_pct
+    """
     layer = QgsVectorLayer(
         "None",
-        "사업지역_생태자연도_면적",
+        "사업지역 생태자연도 면적",
         "memory",
     )
     provider = layer.dataProvider()
@@ -343,7 +379,11 @@ def create_summary_layer(
     fields = QgsFields()
     fields.append(QgsField("순번", QVariant.Int))
     fields.append(
-        QgsField("등급", QVariant.String, len=30)
+        QgsField(
+            "생태자연도",
+            QVariant.String,
+            len=30,
+        )
     )
     fields.append(
         QgsField(
