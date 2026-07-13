@@ -10,15 +10,20 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree
 
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtGui import QColor
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsRectangle,
+    QgsCategorizedSymbolRenderer,
     QgsFeature,
+    QgsField,
+    QgsFillSymbol,
     QgsProject,
     QgsRasterLayer,
+    QgsRendererCategory,
     QgsVectorLayer,
     QgsWkbTypes,
 )
@@ -397,6 +402,11 @@ class ApiManager:
 
         merged.setName("생태자연도_WFS_분할병합")
         merged.setCrs(target_crs)
+
+        # 속성표에 표준 생태자연도 필드를 만들고,
+        # 등급별 자동 분류 심볼을 적용합니다.
+        self._prepare_ecology_grade_and_style(merged)
+
         QgsProject.instance().addMapLayer(merged)
 
         self.log(
@@ -414,6 +424,295 @@ class ApiManager:
         )
 
         return merged
+
+    def _prepare_ecology_grade_and_style(self, layer):
+        """
+        병합된 생태자연도 레이어에 '생태자연도' 필드를 추가하고
+        각 객체를 1등급·2등급·3등급·별도관리지역으로 표준화합니다.
+        """
+        source_field = self._resolve_ecology_grade_field(layer)
+
+        field_index = layer.fields().indexOf("생태자연도")
+        if field_index < 0:
+            provider = layer.dataProvider()
+            provider.addAttributes(
+                [
+                    QgsField(
+                        "생태자연도",
+                        QVariant.String,
+                        len=30,
+                    )
+                ]
+            )
+            layer.updateFields()
+            field_index = layer.fields().indexOf("생태자연도")
+
+        changes = {}
+        counts = {
+            "1등급": 0,
+            "2등급": 0,
+            "3등급": 0,
+            "별도관리지역": 0,
+            "미분류": 0,
+        }
+
+        for feature in layer.getFeatures():
+            raw_value = (
+                feature[source_field]
+                if source_field
+                else None
+            )
+            grade = self._normalize_ecology_grade(raw_value)
+            changes[feature.id()] = {
+                field_index: grade
+            }
+            counts[grade] = counts.get(grade, 0) + 1
+
+        if changes:
+            layer.dataProvider().changeAttributeValues(changes)
+            layer.updateFields()
+
+        self._apply_ecology_categorized_style(layer)
+        layer.triggerRepaint()
+
+        self.log(
+            "생태자연도 속성 정리 완료: "
+            "1등급 %s건, 2등급 %s건, 3등급 %s건, "
+            "별도관리지역 %s건, 미분류 %s건"
+            % (
+                counts.get("1등급", 0),
+                counts.get("2등급", 0),
+                counts.get("3등급", 0),
+                counts.get("별도관리지역", 0),
+                counts.get("미분류", 0),
+            )
+        )
+
+    def _resolve_ecology_grade_field(self, layer):
+        """원본 WFS 속성에서 생태자연도 등급 필드를 찾습니다."""
+        candidates = (
+            "생태자연도",
+            "등급",
+            "생태자연도등급",
+            "자연도등급",
+            "평가등급",
+            "dgre",
+            "grade",
+            "grd",
+            "eczm_grade",
+            "eczm_grd",
+            "ecology_grade",
+            "ecol_grade",
+            "nature_grade",
+            "rank",
+        )
+
+        lookup = {
+            field.name().lower(): field.name()
+            for field in layer.fields()
+        }
+
+        # 새로 만드는 대상 필드는 원본 후보에서 제외합니다.
+        for candidate in candidates:
+            actual = lookup.get(candidate.lower())
+            if actual and actual != "생태자연도":
+                return actual
+
+        # 필드명이 예상과 다를 경우, 실제 값에서 등급 패턴을 찾습니다.
+        best_field = None
+        best_score = 0
+
+        for field in layer.fields():
+            if field.name() == "생태자연도":
+                continue
+
+            score = 0
+            checked = 0
+
+            for feature in layer.getFeatures():
+                value = feature[field.name()]
+                if value in (None, ""):
+                    continue
+
+                checked += 1
+                normalized = self._normalize_ecology_grade(value)
+                if normalized != "미분류":
+                    score += 1
+
+                if checked >= 100:
+                    break
+
+            if score > best_score:
+                best_score = score
+                best_field = field.name()
+
+        if best_field and best_score >= 3:
+            self.log(
+                "생태자연도 등급 원본 필드를 자동 탐지했습니다: %s"
+                % best_field
+            )
+            return best_field
+
+        self.log(
+            "경고: 생태자연도 등급 원본 필드를 찾지 못해 "
+            "모든 객체를 미분류로 처리합니다."
+        )
+        return None
+
+    def _normalize_ecology_grade(self, value):
+        """원본 등급값을 네 가지 표준 명칭으로 변환합니다."""
+        compact = (
+            str(value or "")
+            .strip()
+            .lower()
+            .replace(" ", "")
+            .replace("_", "")
+            .replace("-", "")
+        )
+
+        if not compact:
+            return "미분류"
+
+        if (
+            "별도관리지역" in compact
+            or "별도관리" in compact
+            or compact in (
+                "별도",
+                "4",
+                "04",
+                "special",
+                "separate",
+            )
+        ):
+            return "별도관리지역"
+
+        if (
+            "1등급" in compact
+            or compact in (
+                "1",
+                "01",
+                "i",
+                "grade1",
+                "class1",
+            )
+        ):
+            return "1등급"
+
+        if (
+            "2등급" in compact
+            or compact in (
+                "2",
+                "02",
+                "ii",
+                "grade2",
+                "class2",
+            )
+        ):
+            return "2등급"
+
+        if (
+            "3등급" in compact
+            or compact in (
+                "3",
+                "03",
+                "iii",
+                "grade3",
+                "class3",
+            )
+        ):
+            return "3등급"
+
+        return "미분류"
+
+    def _apply_ecology_categorized_style(self, layer):
+        """'생태자연도' 필드 기준의 자동 분류 심볼을 적용합니다."""
+        categories = []
+
+        grade1_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "#1ea725",
+                "outline_color": "#1ea725",
+                "outline_width": "0.20",
+            }
+        )
+        categories.append(
+            QgsRendererCategory(
+                "1등급",
+                grade1_symbol,
+                "1등급",
+            )
+        )
+
+        grade2_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "#cfe3c9",
+                "outline_color": "#9ebc96",
+                "outline_width": "0.15",
+            }
+        )
+        categories.append(
+            QgsRendererCategory(
+                "2등급",
+                grade2_symbol,
+                "2등급",
+            )
+        )
+
+        # 3등급은 채우기와 외곽선을 모두 표시하지 않습니다.
+        grade3_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "0,0,0,0",
+                "outline_style": "no",
+            }
+        )
+        grade3_symbol.setOpacity(0.0)
+        categories.append(
+            QgsRendererCategory(
+                "3등급",
+                grade3_symbol,
+                "3등급",
+            )
+        )
+
+        # 별도관리지역은 사용자가 별도 색상을 지정하지 않아
+        # 구분 가능한 주황색 반투명 심볼을 기본 적용합니다.
+        special_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "#f4b183",
+                "outline_color": "#d97941",
+                "outline_width": "0.25",
+            }
+        )
+        special_symbol.setOpacity(0.70)
+        categories.append(
+            QgsRendererCategory(
+                "별도관리지역",
+                special_symbol,
+                "별도관리지역",
+            )
+        )
+
+        unclassified_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "0,0,0,0",
+                "outline_color": "#808080",
+                "outline_width": "0.15",
+                "outline_style": "dot",
+            }
+        )
+        categories.append(
+            QgsRendererCategory(
+                "미분류",
+                unclassified_symbol,
+                "미분류",
+            )
+        )
+
+        renderer = QgsCategorizedSymbolRenderer(
+            "생태자연도",
+            categories,
+        )
+        layer.setRenderer(renderer)
 
     def _build_ecology_grid(
         self,
