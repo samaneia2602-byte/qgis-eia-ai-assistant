@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-
+from .cadastral_report import build_cadastral_report
 import os
 import processing
 from collections import defaultdict
@@ -636,14 +636,16 @@ def run_cadastral_area_analysis(
     saved_path = None
     if options.get("save_excel", True) and output_path:
         _log(log_callback, "Excel 결과표를 저장하는 중입니다...")
-        saved_path = export_summary_xlsx(
-            summary_layer,
-            output_path,
-            rows,
-            total_count,
-            total_area,
-            report_style=options.get("report_style", True),
-        )
+        engine = build_cadastral_report(
+    rows=rows,
+    total_count=total_count,
+    total_area_m2=total_area,
+    business_layer_name=business.name(),
+    cadastral_layer_name=cadastral.name(),
+    project_name=business.name(),
+    )
+
+    saved_path = engine.export_excel(output_path)
         _log(log_callback, "Excel 저장 완료")
 
     return {
