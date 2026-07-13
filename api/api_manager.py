@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import hashlib
 import json
+import math
 import os
 import tempfile
 import urllib.error
@@ -8,13 +10,17 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree
 
+from qgis.PyQt.QtCore import QCoreApplication
+
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsRectangle,
+    QgsFeature,
     QgsProject,
     QgsRasterLayer,
     QgsVectorLayer,
+    QgsWkbTypes,
 )
 
 from .geometry import (
@@ -192,14 +198,13 @@ class ApiManager:
 
     def load_ecology_wfs(self):
         """
-        국립생태원 생태자연도 WFS API를 기술문서 규격대로 호출합니다.
+        생태자연도 WFS를 EPSG:5186 격자로 분할 조회한 뒤
+        중복 객체를 제거하고 하나의 메모리 레이어로 병합합니다.
 
         기술문서 기준:
-        - 서비스 경로: /B553084/ecoapi/EcologyzmpService/wfs/getEcologyzmpWFS
         - typeName=tbl_opn_eczm
-        - bbox는 EPSG:5186 좌표값 사용
+        - bbox=EPSG:5186의 minX,minY,maxX,maxY
         - maxFeatures 최대 500
-        - 응답은 GML/XML FeatureCollection
         """
         raw_key = (self.store.ecology_key or "").strip()
 
@@ -210,9 +215,7 @@ class ApiManager:
             )
             return None
 
-        # 저장값이 Encoding 키든 Decoding 키든 URL 인코딩은 한 번만 적용합니다.
         service_key = urllib.parse.unquote(raw_key)
-
         extent, source_crs = active_or_selected_extent(self.iface)
 
         target_crs = QgsCoordinateReferenceSystem("EPSG:5186")
@@ -234,64 +237,397 @@ class ApiManager:
             )
             return None
 
-        # 기술문서 예시와 같이 minX,minY,maxX,maxY 순서
-        bbox = "%.4f,%.4f,%.4f,%.4f" % (
-            extent_5186.xMinimum(),
-            extent_5186.yMinimum(),
-            extent_5186.xMaximum(),
-            extent_5186.yMaximum(),
-        )
-
         base = (
             "http://apis.data.go.kr/B553084/"
             "ecoapi/EcologyzmpService/"
             "wfs/getEcologyzmpWFS"
         )
 
-        params = {
-            "serviceKey": service_key,
-            "typeName": "tbl_opn_eczm",
-            "bbox": bbox,
-            "maxFeatures": 500,
-        }
-
-        self.log(
-            "생태자연도 WFS BBOX EPSG:5186 = %s"
-            % bbox
+        initial_tiles = self._build_ecology_grid(
+            extent_5186,
+            preferred_size=5000.0,
+            max_initial_tiles=100,
         )
 
-        try:
-            layer = self._request_ecology_vector(
-                base,
-                params,
-                attempt=1,
+        self.log(
+            "생태자연도 격자 분할조회 시작: "
+            "초기 %s개 격자, EPSG:5186"
+            % len(initial_tiles)
+        )
+
+        queue = list(initial_tiles)
+        accepted_layers = []
+        request_count = 0
+        failed_count = 0
+        split_count = 0
+        max_requests = 300
+        min_tile_size = 250.0
+
+        while queue:
+            if request_count >= max_requests:
+                self.log(
+                    "경고: 최대 요청 횟수 %s회에 도달하여 "
+                    "남은 격자 조회를 중단합니다."
+                    % max_requests
+                )
+                break
+
+            tile = queue.pop(0)
+            request_count += 1
+
+            bbox = "%.4f,%.4f,%.4f,%.4f" % (
+                tile.xMinimum(),
+                tile.yMinimum(),
+                tile.xMaximum(),
+                tile.yMaximum(),
             )
-        except Exception as exc:
+
+            params = {
+                "serviceKey": service_key,
+                "typeName": "tbl_opn_eczm",
+                "bbox": bbox,
+                "maxFeatures": 500,
+            }
+
             self.log(
-                "생태자연도 WFS 호출 실패: %s"
-                % exc
+                "생태자연도 격자 조회 %s "
+                "(대기 %s): %s"
+                % (
+                    request_count,
+                    len(queue),
+                    bbox,
+                )
+            )
+            QCoreApplication.processEvents()
+
+            try:
+                tile_layer = self._request_ecology_vector(
+                    base,
+                    params,
+                    attempt=request_count,
+                )
+            except Exception as exc:
+                failed_count += 1
+                self.log(
+                    "경고: 격자 조회 실패, 계속 진행합니다: %s"
+                    % exc
+                )
+                continue
+
+            if not tile_layer or not tile_layer.isValid():
+                failed_count += 1
+                self.log(
+                    "경고: 유효하지 않은 격자 응답을 건너뜁니다."
+                )
+                continue
+
+            if not tile_layer.crs().isValid():
+                tile_layer.setCrs(target_crs)
+
+            feature_count = tile_layer.featureCount()
+
+            # API 최대 허용값인 500건에 도달하면 잘렸을 가능성이 있으므로
+            # 해당 격자를 4분할하여 다시 조회합니다.
+            if (
+                feature_count >= 500
+                and tile.width() > min_tile_size
+                and tile.height() > min_tile_size
+            ):
+                children = self._split_rectangle(tile)
+                queue = children + queue
+                split_count += 1
+                self.log(
+                    "격자 응답이 500건에 도달하여 "
+                    "4개 하위 격자로 재분할합니다."
+                )
+                continue
+
+            if feature_count >= 500:
+                self.log(
+                    "경고: 최소 격자에서도 500건이 반환되었습니다. "
+                    "일부 객체가 누락될 가능성이 있습니다."
+                )
+
+            if feature_count > 0:
+                accepted_layers.append(tile_layer)
+
+        if not accepted_layers:
+            self.log(
+                "오류: 생태자연도 격자 조회 결과가 없습니다."
             )
             return None
 
-        if layer and layer.isValid():
-            layer.setName("생태자연도_WFS")
-
-            if not layer.crs().isValid():
-                layer.setCrs(target_crs)
-
-            QgsProject.instance().addMapLayer(layer)
-            self.log(
-                "생태자연도 WFS 레이어를 추가했습니다: "
-                "%s개 객체"
-                % layer.featureCount()
+        self.log(
+            "격자 조회 완료: 요청 %s회, 재분할 %s회, "
+            "실패 %s회. 병합 및 중복 제거를 시작합니다."
+            % (
+                request_count,
+                split_count,
+                failed_count,
             )
-            return layer
+        )
+
+        merged, raw_count, unique_count = (
+            self._merge_ecology_layers_deduplicated(
+                accepted_layers,
+                target_crs,
+            )
+        )
+
+        if not merged or not merged.isValid():
+            self.log(
+                "오류: 생태자연도 격자 레이어 병합에 실패했습니다."
+            )
+            return None
+
+        merged.setName("생태자연도_WFS_분할병합")
+        QgsProject.instance().addMapLayer(merged)
 
         self.log(
-            "오류: 생태자연도 WFS 응답을 "
-            "벡터 레이어로 변환하지 못했습니다."
+            "생태자연도 병합 완료: 원본 %s건 → "
+            "중복 제거 후 %s건"
+            % (
+                raw_count,
+                unique_count,
+            )
         )
-        return None
+
+        return merged
+
+    def _build_ecology_grid(
+        self,
+        extent,
+        preferred_size=5000.0,
+        max_initial_tiles=100,
+    ):
+        width = max(extent.width(), 1.0)
+        height = max(extent.height(), 1.0)
+        tile_size = float(preferred_size)
+
+        columns = max(1, int(math.ceil(width / tile_size)))
+        rows = max(1, int(math.ceil(height / tile_size)))
+
+        while columns * rows > max_initial_tiles:
+            tile_size *= 1.25
+            columns = max(
+                1,
+                int(math.ceil(width / tile_size)),
+            )
+            rows = max(
+                1,
+                int(math.ceil(height / tile_size)),
+            )
+
+        tiles = []
+
+        for row in range(rows):
+            y_min = extent.yMinimum() + row * tile_size
+            y_max = min(
+                y_min + tile_size,
+                extent.yMaximum(),
+            )
+
+            for column in range(columns):
+                x_min = extent.xMinimum() + column * tile_size
+                x_max = min(
+                    x_min + tile_size,
+                    extent.xMaximum(),
+                )
+
+                if x_max <= x_min or y_max <= y_min:
+                    continue
+
+                tiles.append(
+                    QgsRectangle(
+                        x_min,
+                        y_min,
+                        x_max,
+                        y_max,
+                    )
+                )
+
+        return tiles
+
+    def _split_rectangle(self, rectangle):
+        x_mid = (
+            rectangle.xMinimum()
+            + rectangle.xMaximum()
+        ) / 2.0
+        y_mid = (
+            rectangle.yMinimum()
+            + rectangle.yMaximum()
+        ) / 2.0
+
+        return [
+            QgsRectangle(
+                rectangle.xMinimum(),
+                rectangle.yMinimum(),
+                x_mid,
+                y_mid,
+            ),
+            QgsRectangle(
+                x_mid,
+                rectangle.yMinimum(),
+                rectangle.xMaximum(),
+                y_mid,
+            ),
+            QgsRectangle(
+                rectangle.xMinimum(),
+                y_mid,
+                x_mid,
+                rectangle.yMaximum(),
+            ),
+            QgsRectangle(
+                x_mid,
+                y_mid,
+                rectangle.xMaximum(),
+                rectangle.yMaximum(),
+            ),
+        ]
+
+    def _merge_ecology_layers_deduplicated(
+        self,
+        layers,
+        target_crs,
+    ):
+        first_layer = next(
+            (
+                layer
+                for layer in layers
+                if layer and layer.isValid()
+            ),
+            None,
+        )
+
+        if not first_layer:
+            return None, 0, 0
+
+        geometry_name = QgsWkbTypes.displayString(
+            first_layer.wkbType()
+        )
+        auth_id = (
+            first_layer.crs().authid()
+            if first_layer.crs().isValid()
+            else target_crs.authid()
+        )
+
+        merged = QgsVectorLayer(
+            "%s?crs=%s"
+            % (
+                geometry_name,
+                auth_id,
+            ),
+            "생태자연도_WFS_분할병합",
+            "memory",
+        )
+
+        provider = merged.dataProvider()
+        provider.addAttributes(
+            list(first_layer.fields())
+        )
+        merged.updateFields()
+
+        seen = set()
+        output_features = []
+        raw_count = 0
+
+        for layer in layers:
+            if not layer or not layer.isValid():
+                continue
+
+            for source_feature in layer.getFeatures():
+                raw_count += 1
+                geometry = source_feature.geometry()
+
+                if not geometry or geometry.isEmpty():
+                    continue
+
+                key = self._ecology_feature_key(
+                    source_feature
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                output_feature = QgsFeature(
+                    merged.fields()
+                )
+                output_feature.setGeometry(
+                    geometry
+                )
+                output_feature.setAttributes(
+                    source_feature.attributes()
+                )
+                output_features.append(
+                    output_feature
+                )
+
+                if len(output_features) >= 1000:
+                    provider.addFeatures(
+                        output_features
+                    )
+                    output_features = []
+                    QCoreApplication.processEvents()
+
+        if output_features:
+            provider.addFeatures(output_features)
+
+        merged.updateExtents()
+        return merged, raw_count, len(seen)
+
+    def _ecology_feature_key(self, feature):
+        """
+        격자 경계에서 반복 반환된 동일 피처를 제거합니다.
+        우선 GML/FID 계열 식별자를 사용하고,
+        없으면 도형 WKB와 속성값의 SHA-1 해시를 사용합니다.
+        """
+        field_lookup = {
+            field.name().lower(): field.name()
+            for field in feature.fields()
+        }
+
+        for candidate in (
+            "gml_id",
+            "gmlid",
+            "fid",
+            "objectid",
+            "ogc_fid",
+            "id",
+        ):
+            actual = field_lookup.get(candidate)
+            if actual:
+                value = feature[actual]
+                if value not in (None, ""):
+                    return "id:%s:%s" % (
+                        candidate,
+                        value,
+                    )
+
+        digest = hashlib.sha1()
+        geometry = feature.geometry()
+
+        try:
+            digest.update(bytes(geometry.asWkb()))
+        except Exception:
+            digest.update(
+                geometry.asWkt().encode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+        for value in feature.attributes():
+            digest.update(b"|")
+            digest.update(
+                str(value).encode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+        return "hash:%s" % digest.hexdigest()
 
     def _request_ecology_vector(
         self,
