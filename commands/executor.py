@@ -8,6 +8,7 @@ from qgis.core import QgsProject, QgsRectangle, QgsVectorLayer
 from .parser import parse_command
 from ..analysis.cadastral_stats import run_cadastral_area_analysis
 from ..analysis.jimok import cleanup_jimok
+from ..analysis.workflow_engine import FullAnalysisWorkflow
 from ..api.api_manager import ApiManager
 from ..ui.api_settings import ApiSettingsDialog
 from ..ui.cadastral_options_dialog import CadastralOptionsDialog
@@ -18,6 +19,11 @@ class CommandExecutor:
         self.iface = iface
         self.log = log
         self.api = ApiManager(iface, log)
+        self.workflow = FullAnalysisWorkflow(
+            iface,
+            log,
+            self.api,
+        )
 
     def execute(self, text):
         cmd = parse_command(text)
@@ -33,6 +39,9 @@ class CommandExecutor:
 
         if cmd == "open_file":
             return self.open_file()
+
+        if cmd == "full_analysis":
+            return self.full_analysis()
 
         if cmd == "jimok_cleanup":
             return self.jimok_cleanup()
@@ -84,11 +93,49 @@ class CommandExecutor:
         else:
             self.log("오류: 파일을 열 수 없습니다.")
 
+    def full_analysis(self):
+        dialog = CadastralOptionsDialog(
+            self.iface.mainWindow()
+        )
+        dialog.setWindowTitle("사업지역 종합분석")
+
+        if not dialog.exec_():
+            self.log("사업지역 종합분석을 취소했습니다.")
+            return
+
+        options = dialog.options()
+        output_path = None
+
+        if options.get("save_excel", True):
+            output_path, _ = QFileDialog.getSaveFileName(
+                self.iface.mainWindow(),
+                "사업지역 종합분석 보고서 저장",
+                "사업지역_종합분석_보고서.xlsx",
+                "Excel 통합문서 (*.xlsx)",
+            )
+
+            if not output_path:
+                self.log(
+                    "보고서 저장 위치를 선택하지 않아 "
+                    "종합분석을 취소했습니다."
+                )
+                return
+
+        self.log("=" * 48)
+        self.log("사업지역 종합분석을 시작합니다.")
+        self.log("=" * 48)
+
+        try:
+            return self.workflow.run(
+                output_path=output_path,
+                options=options,
+            )
+        except Exception as exc:
+            self.log("오류: 사업지역 종합분석에 실패했습니다.")
+            self.log(str(exc))
+            return None
+
     def load_cadastral_and_cleanup(self):
-        """
-        VWorld 연속지적도를 불러온 뒤 같은 레이어에
-        '지목' 필드를 자동 생성·정리합니다.
-        """
         layer = self.api.load_vworld_cadastral()
 
         if not layer:
@@ -113,14 +160,12 @@ class CommandExecutor:
             return layer
 
         if isinstance(result, dict):
-            updated = result.get("updated", 0)
-            unclassified = result.get("unclassified", 0)
             self.log(
                 "연속지적도 및 지목 테이블 정리 완료: "
                 "변경 %s건, 미분류 %s건"
                 % (
-                    updated,
-                    unclassified,
+                    result.get("updated", 0),
+                    result.get("unclassified", 0),
                 )
             )
         else:
@@ -186,7 +231,10 @@ class CommandExecutor:
             )
 
             if not output_path:
-                self.log("Excel 저장 위치를 선택하지 않아 분석을 취소했습니다.")
+                self.log(
+                    "Excel 저장 위치를 선택하지 않아 "
+                    "분석을 취소했습니다."
+                )
                 return
 
         self.log("지목별 면적 분석을 시작합니다.")

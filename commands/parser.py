@@ -17,7 +17,17 @@ def parse_command(text):
     if "파일열기" in t:
         return "open_file"
 
-    # 면적/산출/집계 명령을 지목 정리보다 먼저 판정합니다.
+    # 종합분석은 개별 지목/면적 명령보다 먼저 판정합니다.
+    if (
+        ("사업지역" in t or "사업구역" in t or "사업지" in t)
+        and (
+            "종합분석" in t
+            or ("종합" in t and "분석" in t)
+            or "전체분석" in t
+        )
+    ):
+        return "full_analysis"
+
     if (
         "지목" in t
         and (
