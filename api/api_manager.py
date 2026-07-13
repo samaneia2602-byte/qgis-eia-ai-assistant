@@ -242,15 +242,37 @@ class ApiManager:
                 "bbox": bbox,
                 "coordType": "EPSG:4326",
                 "resultType": "json",
+                "pageNo": 1,
+                "numOfRows": 1000,
             },
             {
                 "serviceKey": service_key,
-                "minx": e4326.xMinimum(),
-                "miny": e4326.yMinimum(),
-                "maxx": e4326.xMaximum(),
-                "maxy": e4326.yMaximum(),
+                "bbox": bbox,
                 "crs": "EPSG:4326",
-                "format": "json",
+                "type": "json",
+                "pageNo": 1,
+                "numOfRows": 1000,
+            },
+            {
+                "serviceKey": service_key,
+                "service": "WFS",
+                "request": "GetFeature",
+                "version": "1.1.0",
+                "bbox": bbox,
+                "srsName": "EPSG:4326",
+                "outputFormat": "application/json",
+                "maxFeatures": 1000,
+            },
+            {
+                "serviceKey": service_key,
+                "minX": e4326.xMinimum(),
+                "minY": e4326.yMinimum(),
+                "maxX": e4326.xMaximum(),
+                "maxY": e4326.yMaximum(),
+                "coordType": "EPSG:4326",
+                "resultType": "json",
+                "pageNo": 1,
+                "numOfRows": 1000,
             },
         ]
 
@@ -380,11 +402,20 @@ class ApiManager:
                 "utf-8",
                 errors="replace",
             )
+            detail_text = self._short_text(detail)
+
+            if not detail_text:
+                detail_text = (
+                    "응답 본문 없음. 서버가 요청변수 조합을 "
+                    "처리하지 못했을 가능성이 큽니다."
+                )
+
             raise RuntimeError(
-                "HTTP %s: %s"
+                "HTTP %s %s: %s"
                 % (
                     exc.code,
-                    self._short_text(detail),
+                    getattr(exc, "reason", ""),
+                    detail_text,
                 )
             )
         except urllib.error.URLError as exc:
