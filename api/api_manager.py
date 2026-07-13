@@ -578,6 +578,8 @@ class ApiManager:
                 "별도",
                 "4",
                 "04",
+                "9",
+                "09",
                 "special",
                 "separate",
             )
