@@ -224,10 +224,21 @@ class NumericMapProcessor:
                 if not extent:
                     continue
 
-                source_authid, distance_km = self._resolve_source_crs(
+                source_authid, distance_km, swap_xy = self._resolve_source_crs(
                     ogr_layer,
                     extent,
                     business_center_wgs84,
+                )
+
+                _log(
+                    self.log,
+                    "원본 좌표범위: X=%.3f~%.3f, Y=%.3f~%.3f"
+                    % (
+                        float(extent[0]),
+                        float(extent[1]),
+                        float(extent[2]),
+                        float(extent[3]),
+                    ),
                 )
 
                 if not source_authid:
@@ -244,12 +255,13 @@ class NumericMapProcessor:
 
                 _log(
                     self.log,
-                    "좌표계 판별: %s / %s → %s "
+                    "좌표계 판별: %s / %s → %s%s "
                     "(사업지역 중심과 약 %.2fkm)"
                     % (
                         os.path.basename(path),
                         layer_name,
                         source_authid,
+                        " + XY교환" if swap_xy else "",
                         distance_km,
                     ),
                 )
@@ -260,6 +272,7 @@ class NumericMapProcessor:
                     layer_name,
                     source_authid,
                     search_extent,
+                    swap_xy,
                 )
                 candidates.extend(layer_candidates)
 
@@ -271,6 +284,7 @@ class NumericMapProcessor:
                         "candidate_count": len(
                             layer_candidates
                         ),
+                        "swap_xy": swap_xy,
                     }
                 )
 
@@ -363,6 +377,16 @@ class NumericMapProcessor:
         extent,
         business_center_wgs84,
     ):
+        """
+        내장 CRS가 없는 DXF를 위해 다음 두 축 순서를 모두 시험합니다.
+
+        1. 일반 GIS 순서: X=동서(Easting), Y=남북(Northing)
+        2. 국내 CAD에서 종종 쓰는 순서: X=남북, Y=동서
+
+        온맵 XML 예시처럼 동부원점 좌표가
+        E=151000, N=508000인데 DXF에 X=508000, Y=151000으로
+        저장된 경우 두 번째 방식으로 정확히 판별됩니다.
+        """
         embedded = self._embedded_authid(
             ogr_layer.GetSpatialRef()
         )
@@ -384,51 +408,64 @@ class NumericMapProcessor:
 
         best_authid = None
         best_distance = None
+        best_swap_xy = False
 
         for authid in candidates:
-            result = self._transform_xy_to_wgs84(
-                center_x,
-                center_y,
-                authid,
-            )
-            if result is None:
-                continue
+            for swap_xy in (False, True):
+                test_x = center_y if swap_xy else center_x
+                test_y = center_x if swap_xy else center_y
 
-            lon, lat = result
+                result = self._transform_xy_to_wgs84(
+                    test_x,
+                    test_y,
+                    authid,
+                )
+                if result is None:
+                    continue
 
-            if not (
-                123.0 <= lon <= 133.5
-                and 32.0 <= lat <= 40.5
-            ):
-                continue
+                lon, lat = result
 
-            distance = self._haversine_km(
-                lon,
-                lat,
-                business_center_wgs84.x(),
-                business_center_wgs84.y(),
-            )
+                if not (
+                    123.0 <= lon <= 133.5
+                    and 32.0 <= lat <= 40.5
+                ):
+                    continue
 
-            # 내장 CRS는 정상 위치일 때 약간 우선합니다.
-            if authid == embedded:
-                distance *= 0.95
+                distance = self._haversine_km(
+                    lon,
+                    lat,
+                    business_center_wgs84.x(),
+                    business_center_wgs84.y(),
+                )
 
-            if (
-                best_distance is None
-                or distance < best_distance
-            ):
-                best_distance = distance
-                best_authid = authid
+                # 정상 내장 CRS와 일반 축순서를 우선합니다.
+                if authid == embedded:
+                    distance *= 0.95
+                if swap_xy:
+                    distance += 0.01
 
-        # 다른 도엽이 섞여 있을 수 있으므로 100km까지 허용합니다.
+                if (
+                    best_distance is None
+                    or distance < best_distance
+                ):
+                    best_distance = distance
+                    best_authid = authid
+                    best_swap_xy = swap_xy
+
+        # 도엽 4장 정도를 고려해 허용거리를 넓히되,
+        # 완전히 다른 지역 자료가 섞이는 것은 막습니다.
         if (
             best_authid is None
             or best_distance is None
-            or best_distance > 100.0
+            or best_distance > 200.0
         ):
-            return None, 0.0
+            return None, 0.0, False
 
-        return best_authid, best_distance
+        return (
+            best_authid,
+            best_distance,
+            best_swap_xy,
+        )
 
     def _embedded_authid(self, spatial_ref):
         if spatial_ref is None:
@@ -516,6 +553,52 @@ class NumericMapProcessor:
             )
         )
 
+    def _swap_geometry_xy(
+        self,
+        geometry,
+    ):
+        """
+        OGR 버전에 관계없이 geometry의 X/Y를 교환합니다.
+        """
+        if geometry is None:
+            return
+
+        if hasattr(geometry, "SwapXY"):
+            geometry.SwapXY()
+            return
+
+        child_count = geometry.GetGeometryCount()
+
+        if child_count > 0:
+            for index in range(child_count):
+                child = geometry.GetGeometryRef(
+                    index
+                )
+                if child is not None:
+                    self._swap_geometry_xy(
+                        child
+                    )
+            return
+
+        point_count = geometry.GetPointCount()
+
+        for index in range(point_count):
+            point = geometry.GetPoint(index)
+
+            if len(point) >= 3:
+                geometry.SetPoint(
+                    index,
+                    float(point[1]),
+                    float(point[0]),
+                    float(point[2]),
+                )
+            else:
+                geometry.SetPoint_2D(
+                    index,
+                    float(point[1]),
+                    float(point[0]),
+                )
+
     def _collect_layer_candidates(
         self,
         path,
@@ -523,6 +606,7 @@ class NumericMapProcessor:
         layer_name,
         source_authid,
         search_extent,
+        swap_xy=False,
     ):
         source_ref = osr.SpatialReference()
         source_ref.ImportFromEPSG(
@@ -589,6 +673,12 @@ class NumericMapProcessor:
                     cad_layer_name = str(value)
 
             transformed = geometry.Clone()
+
+            if swap_xy:
+                self._swap_geometry_xy(
+                    transformed
+                )
+
             try:
                 transformed.Transform(
                     coordinate_transform
@@ -639,6 +729,7 @@ class NumericMapProcessor:
                     "source_layer": layer_name,
                     "cad_layer": cad_layer_name,
                     "source_crs": source_authid,
+                    "swap_xy": swap_xy,
                 }
             )
 
