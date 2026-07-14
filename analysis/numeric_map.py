@@ -4,6 +4,7 @@ import math
 import os
 import re
 import tempfile
+from pathlib import Path
 
 import numpy as np
 from osgeo import ogr, osr
@@ -51,6 +52,8 @@ CONTOUR_KEYWORDS = (
     "등고선",
     "주곡선",
     "계곡선",
+    # 국토지리정보원 수치지도 지형/등고선 계열 코드
+    "f00171",
 )
 
 EXCLUDE_KEYWORDS = (
@@ -441,9 +444,32 @@ class NumericMapProcessor:
             dataset = None
 
         if not candidates:
+            _log(
+                self.log,
+                "OGR에서 표고 Z값을 읽지 못했습니다. "
+                "DXF 원문에서 LWPOLYLINE/POLYLINE 표고를 다시 검색합니다.",
+            )
+
+            for path in paths:
+                if not path.lower().endswith(".dxf"):
+                    continue
+
+                fallback_authid = (
+                    forced_source_authid
+                    or "EPSG:5187"
+                )
+
+                raw_candidates = self._collect_raw_dxf_candidates(
+                    path,
+                    fallback_authid,
+                    search_extent,
+                )
+                candidates.extend(raw_candidates)
+
+        if not candidates:
             raise RuntimeError(
-                "사업지역 주변에서 일정한 Z값을 가진 등고선이나 "
-                "표고 필드를 찾지 못했습니다."
+                "수치지도 위치는 확인했지만 등고선 표고값을 읽지 못했습니다. "
+                "DXF 객체의 Layer 코드와 Elevation/Z 저장방식을 확인해야 합니다."
             )
 
         accepted = self._filter_contour_candidates(
@@ -914,6 +940,433 @@ class NumericMapProcessor:
 
         return result
 
+    def _collect_raw_dxf_candidates(
+        self,
+        path,
+        source_authid,
+        search_extent,
+    ):
+        """
+        OGR/QGIS 3.16이 AcDbPolyline의 고도값을 누락하는 경우를 위한
+        ASCII DXF 직접 해석 fallback.
+
+        지원:
+        - LWPOLYLINE: 8=Layer, 38=Elevation, 10/20=XY, 30=Z
+        - POLYLINE + VERTEX: 8=Layer, 10/20/30=XYZ
+        """
+        try:
+            pairs = self._read_dxf_pairs(path)
+        except Exception as exc:
+            _log(
+                self.log,
+                "경고: DXF 원문 읽기 실패: %s" % exc,
+            )
+            return []
+
+        entities = self._parse_dxf_entities(pairs)
+        result = []
+
+        source_ref = osr.SpatialReference()
+        source_ref.ImportFromEPSG(
+            int(source_authid.split(":")[1])
+        )
+        target_ref = osr.SpatialReference()
+        target_ref.ImportFromEPSG(5179)
+
+        if hasattr(source_ref, "SetAxisMappingStrategy"):
+            source_ref.SetAxisMappingStrategy(
+                osr.OAMS_TRADITIONAL_GIS_ORDER
+            )
+            target_ref.SetAxisMappingStrategy(
+                osr.OAMS_TRADITIONAL_GIS_ORDER
+            )
+
+        transform = osr.CoordinateTransformation(
+            source_ref,
+            target_ref,
+        )
+
+        inspected = 0
+        accepted_count = 0
+
+        for entity in entities:
+            inspected += 1
+            layer_name = (
+                entity.get("layer")
+                or ""
+            )
+            points = entity.get("points") or []
+
+            if len(points) < 2:
+                continue
+
+            elevation = entity.get("elevation")
+            if elevation is None:
+                z_values = [
+                    point[2]
+                    for point in points
+                    if point[2] is not None
+                    and math.isfinite(point[2])
+                ]
+                if z_values:
+                    spread = max(z_values) - min(z_values)
+                    if spread <= 0.20:
+                        elevation = float(
+                            np.median(z_values)
+                        )
+
+            if elevation is None:
+                continue
+
+            if not (-200.0 <= elevation <= 3000.0):
+                continue
+
+            # 국토지리정보원 등고선 계열 코드 또는 의미 있는 비영점 고도.
+            layer_text = layer_name.lower()
+            is_known_contour = (
+                "f00171" in layer_text
+                or any(
+                    keyword in layer_text
+                    for keyword in CONTOUR_KEYWORDS
+                )
+            )
+
+            if (
+                not is_known_contour
+                and abs(elevation) < 0.01
+            ):
+                continue
+
+            line = ogr.Geometry(
+                ogr.wkbLineString
+            )
+
+            for x, y, z in points:
+                try:
+                    tx, ty, _ = transform.TransformPoint(
+                        float(x),
+                        float(y),
+                        float(
+                            elevation
+                            if z is None
+                            else z
+                        ),
+                    )
+                except Exception:
+                    continue
+
+                line.AddPoint(
+                    float(tx),
+                    float(ty),
+                    float(elevation),
+                )
+
+            if line.GetPointCount() < 2:
+                continue
+
+            envelope = line.GetEnvelope()
+            if not self._envelope_intersects(
+                envelope,
+                search_extent,
+            ):
+                continue
+
+            length = line.Length()
+            if length < 5.0:
+                continue
+
+            score = 170 if is_known_contour else 90
+
+            result.append(
+                {
+                    "geometry": line,
+                    "elevation": float(elevation),
+                    "z_spread": 0.0,
+                    "z_source": "raw_dxf",
+                    "score": score,
+                    "length": length,
+                    "file": path,
+                    "source_layer": "DXF_ENTITIES",
+                    "cad_layer": layer_name,
+                    "source_crs": source_authid,
+                    "swap_xy": False,
+                }
+            )
+            accepted_count += 1
+
+        _log(
+            self.log,
+            "DXF 원문 검사: %s | 객체 %s개 검사, "
+            "등고선 후보 %s개"
+            % (
+                os.path.basename(path),
+                inspected,
+                accepted_count,
+            ),
+        )
+
+        return result
+
+    def _read_dxf_pairs(self, path):
+        raw = Path(path).read_bytes()
+
+        if raw.startswith(
+            b"AutoCAD Binary DXF"
+        ):
+            raise RuntimeError(
+                "Binary DXF는 직접 해석할 수 없습니다. "
+                "ASCII DXF로 저장한 뒤 다시 시도하세요."
+            )
+
+        text = None
+        for encoding in (
+            "utf-8",
+            "cp949",
+            "euc-kr",
+            "latin-1",
+        ):
+            try:
+                text = raw.decode(encoding)
+                break
+            except Exception:
+                continue
+
+        if text is None:
+            raise RuntimeError(
+                "DXF 문자 인코딩을 해석하지 못했습니다."
+            )
+
+        lines = text.replace(
+            "\r\n",
+            "\n",
+        ).replace(
+            "\r",
+            "\n",
+        ).split("\n")
+
+        pairs = []
+        index = 0
+
+        while index + 1 < len(lines):
+            code_text = lines[index].strip()
+            value = lines[index + 1].strip()
+            index += 2
+
+            try:
+                code = int(code_text)
+            except Exception:
+                continue
+
+            pairs.append(
+                (code, value)
+            )
+
+        return pairs
+
+    def _parse_dxf_entities(self, pairs):
+        entities = []
+        index = 0
+        in_entities = False
+
+        while index < len(pairs):
+            code, value = pairs[index]
+
+            if (
+                code == 0
+                and value == "SECTION"
+                and index + 1 < len(pairs)
+                and pairs[index + 1] == (2, "ENTITIES")
+            ):
+                in_entities = True
+                index += 2
+                continue
+
+            if (
+                in_entities
+                and code == 0
+                and value == "ENDSEC"
+            ):
+                break
+
+            if not in_entities:
+                index += 1
+                continue
+
+            if code == 0 and value == "LWPOLYLINE":
+                entity, index = self._parse_lwpolyline(
+                    pairs,
+                    index + 1,
+                )
+                if entity:
+                    entities.append(entity)
+                continue
+
+            if code == 0 and value == "POLYLINE":
+                entity, index = self._parse_polyline(
+                    pairs,
+                    index + 1,
+                )
+                if entity:
+                    entities.append(entity)
+                continue
+
+            index += 1
+
+        return entities
+
+    def _parse_lwpolyline(self, pairs, index):
+        layer_name = ""
+        elevation = None
+        points = []
+        current_x = None
+        current_z = None
+
+        while index < len(pairs):
+            code, value = pairs[index]
+
+            if code == 0:
+                break
+
+            if code == 8:
+                layer_name = value
+            elif code == 38:
+                try:
+                    elevation = float(value)
+                except Exception:
+                    pass
+            elif code == 10:
+                try:
+                    current_x = float(value)
+                    current_z = None
+                except Exception:
+                    current_x = None
+            elif code == 20 and current_x is not None:
+                try:
+                    y = float(value)
+                    points.append(
+                        [
+                            current_x,
+                            y,
+                            current_z,
+                        ]
+                    )
+                except Exception:
+                    pass
+                current_x = None
+            elif code == 30:
+                try:
+                    current_z = float(value)
+                    if points:
+                        points[-1][2] = current_z
+                except Exception:
+                    pass
+
+            index += 1
+
+        return (
+            {
+                "type": "LWPOLYLINE",
+                "layer": layer_name,
+                "elevation": elevation,
+                "points": [
+                    tuple(point)
+                    for point in points
+                ],
+            },
+            index,
+        )
+
+    def _parse_polyline(self, pairs, index):
+        layer_name = ""
+        header_elevation = None
+
+        while index < len(pairs):
+            code, value = pairs[index]
+
+            if code == 0:
+                break
+
+            if code == 8:
+                layer_name = value
+            elif code == 30:
+                try:
+                    header_elevation = float(value)
+                except Exception:
+                    pass
+
+            index += 1
+
+        points = []
+
+        while index < len(pairs):
+            code, value = pairs[index]
+
+            if code == 0 and value == "SEQEND":
+                index += 1
+                break
+
+            if code == 0 and value == "VERTEX":
+                vertex, index = self._parse_vertex(
+                    pairs,
+                    index + 1,
+                )
+                if vertex is not None:
+                    points.append(vertex)
+                continue
+
+            if code == 0 and value not in (
+                "VERTEX",
+                "SEQEND",
+            ):
+                break
+
+            index += 1
+
+        return (
+            {
+                "type": "POLYLINE",
+                "layer": layer_name,
+                "elevation": header_elevation,
+                "points": points,
+            },
+            index,
+        )
+
+    def _parse_vertex(self, pairs, index):
+        x = None
+        y = None
+        z = None
+
+        while index < len(pairs):
+            code, value = pairs[index]
+
+            if code == 0:
+                break
+
+            try:
+                if code == 10:
+                    x = float(value)
+                elif code == 20:
+                    y = float(value)
+                elif code == 30:
+                    z = float(value)
+            except Exception:
+                pass
+
+            index += 1
+
+        if x is None or y is None:
+            return None, index
+
+        return (
+            (
+                x,
+                y,
+                z,
+            ),
+            index,
+        )
+
     def _field_lookup(self, ogr_layer):
         definition = ogr_layer.GetLayerDefn()
         lookup = {}
@@ -1048,6 +1501,8 @@ class NumericMapProcessor:
             score += 120
         elif z_source == "geometry":
             score += 90
+        elif z_source == "raw_dxf":
+            score += 140
 
         if any(
             keyword in name_text
