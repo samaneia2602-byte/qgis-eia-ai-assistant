@@ -3,23 +3,16 @@
 import math
 import os
 import tempfile
-from collections import defaultdict
 
 import numpy as np
 from osgeo import gdal, ogr, osr
 
-from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtWidgets import QFileDialog
 from qgis.core import (
     QgsColorRampShader,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
-    QgsFeature,
-    QgsField,
-    QgsFields,
     QgsGeometry,
-    QgsPointXY,
     QgsProject,
     QgsRasterLayer,
     QgsRasterShader,
@@ -28,33 +21,12 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from .numeric_map import (
+    NumericMapProcessor,
+    choose_numeric_map_files,
+)
 from .report_engine import ReportEngine, ReportSection
 
-
-ELEVATION_FIELD_CANDIDATES = (
-    "elev",
-    "elevation",
-    "el",
-    "height",
-    "altitude",
-    "alt",
-    "z",
-    "contour",
-    "contour_elev",
-    "표고",
-    "고도",
-    "등고",
-    "등고값",
-)
-
-CONTOUR_NAME_KEYWORDS = (
-    "contour",
-    "contours",
-    "등고",
-    "등고선",
-    "5000",
-    "수치지도",
-)
 
 SLOPE_BREAKS = (
     (0.0, 5.0, "0~5°"),
@@ -81,13 +53,17 @@ def _validate_business_layer(iface):
         )
 
     if not layer.isValid():
-        raise RuntimeError("사업지역 레이어가 유효하지 않습니다.")
+        raise RuntimeError(
+            "사업지역 레이어가 유효하지 않습니다."
+        )
 
     if (
         QgsWkbTypes.geometryType(layer.wkbType())
         != QgsWkbTypes.PolygonGeometry
     ):
-        raise RuntimeError("사업지역은 폴리곤 레이어여야 합니다.")
+        raise RuntimeError(
+            "사업지역은 폴리곤 레이어여야 합니다."
+        )
 
     if not layer.crs().isValid():
         raise RuntimeError(
@@ -95,365 +71,11 @@ def _validate_business_layer(iface):
         )
 
     if layer.featureCount() <= 0:
-        raise RuntimeError("사업지역 레이어에 객체가 없습니다.")
+        raise RuntimeError(
+            "사업지역 레이어에 객체가 없습니다."
+        )
 
     return layer
-
-
-def _choose_numeric_map_files(iface):
-    paths, _ = QFileDialog.getOpenFileNames(
-        iface.mainWindow(),
-        "수치지도 파일 선택",
-        "",
-        (
-            "수치지도 (*.dxf *.DXF *.shp *.SHP *.gpkg *.GPKG "
-            "*.geojson *.GeoJSON);;모든 파일 (*.*)"
-        ),
-    )
-    return paths
-
-
-def _load_vector_layers(paths, log_callback=None):
-    layers = []
-    failed = []
-
-    for path in paths:
-        name = os.path.splitext(os.path.basename(path))[0]
-        layer = QgsVectorLayer(path, name, "ogr")
-
-        if not layer.isValid():
-            failed.append(path)
-            _log(
-                log_callback,
-                "경고: 수치지도를 열지 못했습니다: %s" % path,
-            )
-            continue
-
-        geometry_type = QgsWkbTypes.geometryType(layer.wkbType())
-        if geometry_type not in (
-            QgsWkbTypes.LineGeometry,
-            QgsWkbTypes.PointGeometry,
-        ):
-            _log(
-                log_callback,
-                "참고: 선·점 레이어가 아니므로 제외합니다: %s"
-                % name,
-            )
-            continue
-
-        layers.append(layer)
-
-    if not layers:
-        raise RuntimeError(
-            "선형 또는 점형 수치지도 레이어를 찾지 못했습니다."
-        )
-
-    _log(
-        log_callback,
-        "수치지도 %s개를 열었습니다. 실패 %s개."
-        % (len(layers), len(failed)),
-    )
-    return layers
-
-
-def _normalized_field_lookup(layer):
-    return {
-        field.name().strip().lower(): field.name()
-        for field in layer.fields()
-    }
-
-
-def _find_elevation_field(layer):
-    lookup = _normalized_field_lookup(layer)
-
-    for candidate in ELEVATION_FIELD_CANDIDATES:
-        actual = lookup.get(candidate.lower())
-        if actual:
-            return actual
-
-    # 후보 이름이 없어도 숫자형 필드를 일부 표본 검사합니다.
-    best_field = None
-    best_score = -1
-
-    for field in layer.fields():
-        if field.type() not in (
-            QVariant.Int,
-            QVariant.UInt,
-            QVariant.LongLong,
-            QVariant.ULongLong,
-            QVariant.Double,
-        ):
-            continue
-
-        score = 0
-        checked = 0
-
-        for feature in layer.getFeatures():
-            value = feature[field.name()]
-            if value in (None, ""):
-                continue
-
-            checked += 1
-            try:
-                number = float(value)
-            except Exception:
-                continue
-
-            # 일반적인 국내 표고 범위에 들어오면 점수를 줍니다.
-            if -100.0 <= number <= 3000.0:
-                score += 1
-
-            if checked >= 100:
-                break
-
-        if score > best_score:
-            best_score = score
-            best_field = field.name()
-
-    if best_score >= 5:
-        return best_field
-
-    return None
-
-
-def _feature_z_from_geometry(geometry):
-    if not geometry or geometry.isEmpty():
-        return None
-
-    values = []
-
-    try:
-        for vertex in geometry.vertices():
-            z_value = vertex.z()
-            if z_value is None:
-                continue
-            number = float(z_value)
-            if math.isfinite(number):
-                values.append(number)
-    except Exception:
-        return None
-
-    if not values:
-        return None
-
-    # 3D 등고선은 보통 한 객체의 모든 Z가 동일합니다.
-    median = float(np.median(values))
-    spread = max(values) - min(values)
-
-    if spread <= max(0.5, abs(median) * 0.001):
-        return median
-
-    return median
-
-
-def _feature_elevation(feature, geometry, field_name):
-    if field_name:
-        value = feature[field_name]
-        try:
-            number = float(value)
-            if math.isfinite(number):
-                return number
-        except Exception:
-            pass
-
-    return _feature_z_from_geometry(geometry)
-
-
-def _layer_score(layer):
-    name = layer.name().lower()
-    score = 0
-
-    for keyword in CONTOUR_NAME_KEYWORDS:
-        if keyword in name:
-            score += 20
-
-    if _find_elevation_field(layer):
-        score += 100
-
-    if QgsWkbTypes.hasZ(layer.wkbType()):
-        score += 100
-
-    if (
-        QgsWkbTypes.geometryType(layer.wkbType())
-        == QgsWkbTypes.LineGeometry
-    ):
-        score += 20
-
-    return score
-
-
-def _transform_geometry(geometry, source_crs, target_crs):
-    transformed = QgsGeometry(geometry)
-
-    if source_crs != target_crs:
-        transform = QgsCoordinateTransform(
-            source_crs,
-            target_crs,
-            QgsProject.instance().transformContext(),
-        )
-        transformed.transform(transform)
-
-    return transformed
-
-
-def _sample_contours_to_points(
-    layers,
-    target_crs,
-    output_path,
-    log_callback=None,
-):
-    driver = ogr.GetDriverByName("GPKG")
-
-    if os.path.exists(output_path):
-        driver.DeleteDataSource(output_path)
-
-    data_source = driver.CreateDataSource(output_path)
-    spatial_ref = osr.SpatialReference()
-    spatial_ref.ImportFromEPSG(
-        int(target_crs.authid().split(":")[1])
-    )
-
-    output_layer = data_source.CreateLayer(
-        "contour_points",
-        spatial_ref,
-        ogr.wkbPoint,
-    )
-    output_layer.CreateField(
-        ogr.FieldDefn("elev", ogr.OFTReal)
-    )
-
-    selected = sorted(
-        layers,
-        key=_layer_score,
-        reverse=True,
-    )
-
-    total_features = 0
-    accepted_features = 0
-    point_count = 0
-    elevations = []
-
-    for layer in selected:
-        if not layer.crs().isValid():
-            _log(
-                log_callback,
-                "경고: 좌표계가 없는 수치지도는 제외합니다: %s"
-                % layer.name(),
-            )
-            continue
-
-        field_name = _find_elevation_field(layer)
-        score = _layer_score(layer)
-
-        _log(
-            log_callback,
-            "등고선 후보: %s | 점수=%s | 표고필드=%s | Z=%s"
-            % (
-                layer.name(),
-                score,
-                field_name or "없음",
-                "있음" if QgsWkbTypes.hasZ(layer.wkbType()) else "없음",
-            ),
-        )
-
-        for feature in layer.getFeatures():
-            total_features += 1
-            geometry = feature.geometry()
-
-            if not geometry or geometry.isEmpty():
-                continue
-
-            elevation = _feature_elevation(
-                feature,
-                geometry,
-                field_name,
-            )
-
-            if elevation is None:
-                continue
-
-            if not (-500.0 <= elevation <= 9000.0):
-                continue
-
-            transformed = _transform_geometry(
-                geometry,
-                layer.crs(),
-                target_crs,
-            )
-
-            # 선을 적당히 조밀하게 만든 뒤 꼭짓점을 표고 샘플로 사용합니다.
-            if (
-                QgsWkbTypes.geometryType(
-                    transformed.wkbType()
-                )
-                == QgsWkbTypes.LineGeometry
-            ):
-                try:
-                    transformed = transformed.densifyByDistance(20.0)
-                except Exception:
-                    pass
-
-            local_points = 0
-
-            try:
-                vertices = transformed.vertices()
-            except Exception:
-                continue
-
-            for vertex in vertices:
-                ogr_feature = ogr.Feature(
-                    output_layer.GetLayerDefn()
-                )
-                point = ogr.Geometry(ogr.wkbPoint)
-                point.AddPoint(
-                    float(vertex.x()),
-                    float(vertex.y()),
-                )
-                ogr_feature.SetGeometry(point)
-                ogr_feature.SetField(
-                    "elev",
-                    float(elevation),
-                )
-                output_layer.CreateFeature(
-                    ogr_feature
-                )
-                ogr_feature = None
-                local_points += 1
-                point_count += 1
-
-            if local_points > 0:
-                accepted_features += 1
-                elevations.append(float(elevation))
-
-    output_layer.SyncToDisk()
-    data_source = None
-
-    if point_count < 3:
-        raise RuntimeError(
-            "등고선 또는 표고 Z값을 충분히 찾지 못했습니다. "
-            "수치지도에 3D Z값 또는 ELEV·EL·표고 필드가 있는지 확인하세요."
-        )
-
-    _log(
-        log_callback,
-        "표고 샘플 생성 완료: 전체 객체 %s개 중 %s개 사용, "
-        "샘플점 %s개, 표고 %.2f~%.2fm"
-        % (
-            total_features,
-            accepted_features,
-            point_count,
-            min(elevations),
-            max(elevations),
-        ),
-    )
-
-    return {
-        "point_path": output_path,
-        "feature_count": accepted_features,
-        "point_count": point_count,
-        "min_elevation": min(elevations),
-        "max_elevation": max(elevations),
-    }
 
 
 def _business_extent_5179(business):
@@ -950,16 +572,20 @@ def run_vector_terrain_analysis(
             "mode는 elevation, slope, both 중 하나여야 합니다."
         )
 
-    business = _validate_business_layer(iface)
+    business = _validate_business_layer(
+        iface
+    )
 
     _log(
         log_callback,
-        "[1/6] 수치지도 파일을 선택합니다.",
+        "[1/6] 수치지도 파일을 여러 개 선택합니다.",
     )
-    paths = _choose_numeric_map_files(iface)
+    paths = choose_numeric_map_files(iface)
 
     if not paths:
-        raise RuntimeError("수치지도 선택이 취소되었습니다.")
+        raise RuntimeError(
+            "수치지도 선택이 취소되었습니다."
+        )
 
     _log(
         log_callback,
@@ -967,26 +593,27 @@ def run_vector_terrain_analysis(
         % len(paths),
     )
 
-    layers = _load_vector_layers(
-        paths,
+    _log(
         log_callback,
+        "[2/6] 원본 좌표계를 판별하고 등고선을 자동 추출합니다.",
+    )
+    processor = NumericMapProcessor(
+        iface,
+        log_callback,
+    )
+    sample_result = processor.prepare(
+        paths,
+        business,
+        add_contour_layer=True,
     )
 
     work_dir = os.path.join(
         tempfile.gettempdir(),
         "qgis_eia_ai_assistant",
-        "terrain_vector",
+        "terrain_vector_v2",
     )
     os.makedirs(work_dir, exist_ok=True)
 
-    target_crs = QgsCoordinateReferenceSystem(
-        "EPSG:5179"
-    )
-
-    contour_points_path = os.path.join(
-        work_dir,
-        "contour_points.gpkg",
-    )
     dem_path = os.path.join(
         work_dir,
         "사업지역_DEM.tif",
@@ -1002,21 +629,10 @@ def run_vector_terrain_analysis(
 
     _log(
         log_callback,
-        "[2/6] 등고선과 표고 Z값을 자동 탐색합니다.",
-    )
-    sample_result = _sample_contours_to_points(
-        layers,
-        target_crs,
-        contour_points_path,
-        log_callback,
-    )
-
-    _log(
-        log_callback,
-        "[3/6] 수치지도로 DEM을 생성합니다.",
+        "[3/6] 자동 추출한 등고선으로 DEM을 생성합니다.",
     )
     pixel_size = _create_dem(
-        contour_points_path,
+        sample_result["point_path"],
         business,
         dem_path,
         cutline_path,
@@ -1029,9 +645,13 @@ def run_vector_terrain_analysis(
         "gdal",
     )
     if not dem_layer.isValid():
-        raise RuntimeError("생성된 DEM을 QGIS에서 열지 못했습니다.")
+        raise RuntimeError(
+            "생성된 DEM을 QGIS에서 열지 못했습니다."
+        )
 
-    QgsProject.instance().addMapLayer(dem_layer)
+    QgsProject.instance().addMapLayer(
+        dem_layer
+    )
 
     results = {}
 
@@ -1040,12 +660,16 @@ def run_vector_terrain_analysis(
             log_callback,
             "[4/6] 표고 구간별 면적을 계산합니다.",
         )
-        values, cell_area = _read_values(dem_path)
+        values, cell_area = _read_values(
+            dem_path
+        )
         rows, stats = _elevation_rows(
             values,
             cell_area,
         )
-        dem_layer.setName("사업지역_표고")
+        dem_layer.setName(
+            "사업지역_표고"
+        )
         _apply_style(
             dem_layer,
             rows,
@@ -1056,9 +680,16 @@ def run_vector_terrain_analysis(
         if output_path:
             elevation_path = output_path
             if mode == "both":
-                root, extension = os.path.splitext(output_path)
-                elevation_path = root + "_표고" + (
-                    extension or ".xlsx"
+                root, extension = os.path.splitext(
+                    output_path
+                )
+                elevation_path = (
+                    root
+                    + "_표고"
+                    + (
+                        extension
+                        or ".xlsx"
+                    )
                 )
 
             saved_path = _build_report(
@@ -1067,7 +698,9 @@ def run_vector_terrain_analysis(
                 stats,
                 business.name(),
                 paths,
-            ).export_excel(elevation_path)
+            ).export_excel(
+                elevation_path
+            )
 
         results["elevation"] = {
             "result_layer": dem_layer.name(),
@@ -1122,9 +755,16 @@ def run_vector_terrain_analysis(
         if output_path:
             slope_output = output_path
             if mode == "both":
-                root, extension = os.path.splitext(output_path)
-                slope_output = root + "_경사" + (
-                    extension or ".xlsx"
+                root, extension = os.path.splitext(
+                    output_path
+                )
+                slope_output = (
+                    root
+                    + "_경사"
+                    + (
+                        extension
+                        or ".xlsx"
+                    )
                 )
 
             saved_path = _build_report(
@@ -1133,7 +773,9 @@ def run_vector_terrain_analysis(
                 stats,
                 business.name(),
                 paths,
-            ).export_excel(slope_output)
+            ).export_excel(
+                slope_output
+            )
 
         results["slope"] = {
             "result_layer": slope_layer.name(),
@@ -1150,7 +792,8 @@ def run_vector_terrain_analysis(
     _log(
         log_callback,
         "[6/6] 표고·경사 분석을 완료했습니다. "
-        "DEM 셀크기 약 %.2fm" % pixel_size,
+        "DEM 셀크기 약 %.2fm"
+        % pixel_size,
     )
 
     return {
@@ -1161,3 +804,30 @@ def run_vector_terrain_analysis(
         "pixel_size": pixel_size,
         "results": results,
     }
+
+
+def load_and_prepare_numeric_maps(
+    iface,
+    log_callback=None,
+):
+    business = _validate_business_layer(
+        iface
+    )
+    paths = choose_numeric_map_files(
+        iface
+    )
+
+    if not paths:
+        raise RuntimeError(
+            "수치지도 선택이 취소되었습니다."
+        )
+
+    processor = NumericMapProcessor(
+        iface,
+        log_callback,
+    )
+    return processor.prepare(
+        paths,
+        business,
+        add_contour_layer=True,
+    )

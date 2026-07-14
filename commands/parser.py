@@ -55,6 +55,17 @@ def parse_command(text):
         return "onmap_load"
 
     if (
+        "수치지도" in t
+        and (
+            "불러" in t
+            or "가져" in t
+            or "전처리" in t
+            or "등고선" in t
+        )
+    ):
+        return "numeric_map_load"
+
+    if (
         "표고" in t
         and "경사" in t
         and (

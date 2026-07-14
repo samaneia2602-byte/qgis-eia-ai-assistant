@@ -9,7 +9,10 @@ from .parser import parse_command
 from ..analysis.cadastral_stats import run_cadastral_area_analysis
 from ..analysis.ecology_stats import run_ecology_analysis
 from ..analysis.jimok import cleanup_jimok
-from ..analysis.terrain_vector import run_vector_terrain_analysis
+from ..analysis.terrain_vector import (
+    load_and_prepare_numeric_maps,
+    run_vector_terrain_analysis,
+)
 from ..analysis.workflow_engine import FullAnalysisWorkflow
 from ..api.api_manager import ApiManager
 from ..api.ngii import NgiiManager
@@ -61,6 +64,9 @@ class CommandExecutor:
 
         if cmd == "ecology_wfs":
             return self.api.load_ecology_wfs()
+
+        if cmd == "numeric_map_load":
+            return self.numeric_map_load()
 
         if cmd == "elevation_analysis":
             return self.terrain_analysis(
@@ -237,6 +243,45 @@ class CommandExecutor:
             )
             self.log(str(exc))
             return None
+
+    def numeric_map_load(self):
+        self.log("=" * 48)
+        self.log(
+            "국토지리정보원 수치지도 전처리를 시작합니다."
+        )
+        self.log(
+            "여러 DXF·SHP·GPKG를 선택하면 좌표계와 "
+            "등고선을 자동 판별합니다."
+        )
+        self.log("=" * 48)
+
+        try:
+            result = load_and_prepare_numeric_maps(
+                self.iface,
+                log_callback=self.log,
+            )
+        except Exception as exc:
+            self.log(
+                "오류: 수치지도 전처리에 실패했습니다."
+            )
+            self.log(str(exc))
+            return None
+
+        self.log(
+            "수치지도 전처리 완료: 등고선 %s개, "
+            "표고 샘플점 %s개"
+            % (
+                result.get(
+                    "contour_count",
+                    0,
+                ),
+                result.get(
+                    "point_count",
+                    0,
+                ),
+            )
+        )
+        return result
 
     def terrain_analysis(self, mode):
         if mode == "elevation":
