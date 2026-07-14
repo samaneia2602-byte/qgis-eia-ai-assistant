@@ -8,6 +8,23 @@ def normalize(text):
 def parse_command(text):
     t = normalize(text)
 
+    if (
+        (
+            "사업지역좌표" in t
+            or "사업구역좌표" in t
+            or "aermodareasource" in t
+            or "aermod좌표" in t
+            or "areasource생성" in t
+        )
+        and (
+            "추출" in t
+            or "생성" in t
+            or "저장" in t
+            or "만들" in t
+        )
+    ):
+        return "aermod_area_source"
+
     if "api" in t and ("설정" in t or "저장" in t):
         return "api_settings"
 
