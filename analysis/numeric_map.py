@@ -92,6 +92,35 @@ CRS_CANDIDATES = (
 )
 
 
+def _flatten_ogr_geometry_type(geometry_type):
+    """
+    QGIS 3.16에 포함된 구형 GDAL/OGR 호환용 geometry type 평탄화.
+
+    일부 GDAL 버전에는 ogr.wkbFlatten이 없으므로
+    ogr.GT_Flatten을 우선 사용하고, 그것도 없으면
+    Z/M 비트를 직접 제거합니다.
+    """
+    if hasattr(ogr, "GT_Flatten"):
+        return ogr.GT_Flatten(geometry_type)
+
+    if hasattr(ogr, "wkbFlatten"):
+        return ogr.wkbFlatten(geometry_type)
+
+    # OGR geometry type의 25D/Z/M 비트를 제거합니다.
+    value = int(geometry_type)
+    value = value & 0x0FFFFFFF
+
+    # 일부 구형 OGR은 1000/2000/3000 오프셋으로 Z/M을 표현합니다.
+    if value >= 3000:
+        value -= 3000
+    elif value >= 2000:
+        value -= 2000
+    elif value >= 1000:
+        value -= 1000
+
+    return value
+
+
 def _log(callback, message):
     if callback:
         callback(message)
@@ -179,7 +208,7 @@ class NumericMapProcessor:
                 layer_name = ogr_layer.GetName() or (
                     "layer_%s" % layer_index
                 )
-                geometry_type = ogr.wkbFlatten(
+                geometry_type = _flatten_ogr_geometry_type(
                     ogr_layer.GetGeomType()
                 )
 
@@ -574,7 +603,7 @@ class NumericMapProcessor:
             ):
                 continue
 
-            geometry_type = ogr.wkbFlatten(
+            geometry_type = _flatten_ogr_geometry_type(
                 transformed.GetGeometryType()
             )
 
@@ -952,7 +981,7 @@ class NumericMapProcessor:
             geometry = item["geometry"].Clone()
             geometry.FlattenTo2D()
 
-            if ogr.wkbFlatten(
+            if _flatten_ogr_geometry_type(
                 geometry.GetGeometryType()
             ) in (
                 ogr.wkbLineString,
