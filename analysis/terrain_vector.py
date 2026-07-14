@@ -630,11 +630,8 @@ def run_vector_terrain_analysis(
         iface.mainWindow(),
         "수치지도 위치 확인",
         (
-            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?
-
-"
-            "예: 분석을 계속합니다.
-"
+            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?\n\n"
+            "예: 분석을 계속합니다.\n"
             "아니오: 분석을 중단하고 다른 좌표계로 다시 실행합니다."
         ),
         QMessageBox.Yes | QMessageBox.No,
@@ -897,11 +894,8 @@ def load_and_prepare_numeric_maps(
         iface.mainWindow(),
         "수치지도 위치 확인",
         (
-            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?
-
-"
-            "예: 전처리를 완료합니다.
-"
+            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?\n\n"
+            "예: 전처리를 완료합니다.\n"
             "아니오: 결과를 삭제하고 다시 좌표계를 선택합니다."
         ),
         QMessageBox.Yes | QMessageBox.No,
