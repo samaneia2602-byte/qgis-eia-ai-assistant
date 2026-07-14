@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree
 
+import processing
+
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.PyQt.QtGui import QColor
 
@@ -219,6 +221,7 @@ class ApiManager:
             return None
 
         service_key = urllib.parse.unquote(raw_key)
+        reference_layer = self.iface.activeLayer()
         extent, source_crs = active_or_selected_extent(self.iface)
 
         target_crs = QgsCoordinateReferenceSystem("EPSG:5186")
@@ -233,6 +236,13 @@ class ApiManager:
                 QgsProject.instance().transformContext(),
             )
             extent_5186 = transform.transformBoundingBox(extent)
+
+            # 사업지역 경계 바깥의 인접 생태자연도도 확인할 수 있도록
+            # WFS 요청범위를 사방 100m 확장합니다.
+            extent_5186.grow(100.0)
+            self.log(
+                "생태자연도 조회범위를 사업지역 외곽 100m까지 확장합니다."
+            )
         except Exception as exc:
             self.log(
                 "오류: 사업지역 범위를 EPSG:5186으로 변환하지 못했습니다: %s"
@@ -401,6 +411,17 @@ class ApiManager:
         merged.setName("생태자연도_WFS_분할병합")
         merged.setCrs(target_crs)
 
+        # 조회된 객체는 BBOX와 교차하는 전체 폴리곤일 수 있으므로,
+        # 화면 표시용 레이어는 사업지역 100m 버퍼 경계로 정확히 자릅니다.
+        merged = self._clip_ecology_to_business_buffer(
+            merged,
+            reference_layer,
+            target_crs,
+            buffer_distance=100.0,
+        )
+        merged.setName("생태자연도_WFS_사업지역_100m")
+        merged.setCrs(target_crs)
+
         # 속성표에 표준 생태자연도 필드를 만들고,
         # 등급별 자동 분류 심볼을 적용합니다.
         self._prepare_ecology_grade_and_style(merged)
@@ -422,6 +443,101 @@ class ApiManager:
         )
 
         return merged
+
+    def _clip_ecology_to_business_buffer(
+        self,
+        ecology_layer,
+        business_layer,
+        target_crs,
+        buffer_distance=100.0,
+    ):
+        """
+        생태자연도 표시범위를 사업지역 외곽 buffer_distance(m)로 제한합니다.
+
+        분석 면적은 별도의 ecology_stats.py에서 원 사업지역 경계로 다시
+        Clip하므로, 이 버퍼는 주변 현황 표시와 API 조회 누락 방지용입니다.
+        """
+        if (
+            not isinstance(business_layer, QgsVectorLayer)
+            or not business_layer.isValid()
+            or QgsWkbTypes.geometryType(business_layer.wkbType())
+            != QgsWkbTypes.PolygonGeometry
+        ):
+            self.log(
+                "참고: 활성 사업지역 폴리곤을 확인하지 못해 "
+                "100m 정확한 버퍼 Clip은 생략하고 확장 BBOX 결과를 사용합니다."
+            )
+            return ecology_layer
+
+        try:
+            source_business = business_layer
+
+            if business_layer.crs() != target_crs:
+                source_business = processing.run(
+                    "native:reprojectlayer",
+                    {
+                        "INPUT": business_layer,
+                        "TARGET_CRS": target_crs,
+                        "OUTPUT": "memory:",
+                    },
+                )["OUTPUT"]
+
+            fixed_business = processing.run(
+                "native:fixgeometries",
+                {
+                    "INPUT": source_business,
+                    "OUTPUT": "memory:",
+                },
+            )["OUTPUT"]
+
+            buffered = processing.run(
+                "native:buffer",
+                {
+                    "INPUT": fixed_business,
+                    "DISTANCE": float(buffer_distance),
+                    "SEGMENTS": 12,
+                    "END_CAP_STYLE": 0,
+                    "JOIN_STYLE": 0,
+                    "MITER_LIMIT": 2.0,
+                    "DISSOLVE": True,
+                    "OUTPUT": "memory:",
+                },
+            )["OUTPUT"]
+
+            fixed_ecology = processing.run(
+                "native:fixgeometries",
+                {
+                    "INPUT": ecology_layer,
+                    "OUTPUT": "memory:",
+                },
+            )["OUTPUT"]
+
+            clipped = processing.run(
+                "native:clip",
+                {
+                    "INPUT": fixed_ecology,
+                    "OVERLAY": buffered,
+                    "OUTPUT": "memory:",
+                },
+            )["OUTPUT"]
+
+            clipped.setCrs(target_crs)
+            self.log(
+                "생태자연도를 사업지역 외곽 %.0fm 범위로 잘랐습니다: %s개 객체"
+                % (
+                    buffer_distance,
+                    clipped.featureCount(),
+                )
+            )
+            return clipped
+
+        except Exception as exc:
+            self.log(
+                "경고: 생태자연도 100m 버퍼 Clip에 실패하여 "
+                "확장 BBOX 조회 결과를 그대로 사용합니다: %s"
+                % exc
+            )
+            return ecology_layer
 
     def _prepare_ecology_grade_and_style(self, layer):
         """
@@ -578,8 +694,6 @@ class ApiManager:
                 "별도",
                 "4",
                 "04",
-                "9",
-                "09",
                 "special",
                 "separate",
             )
