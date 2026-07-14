@@ -38,7 +38,6 @@ def parse_command(text):
     ):
         return "ecology_analysis"
 
-    # 국토지리정보원 OnMap 명령
     if (
         (
             "온맵" in t
@@ -54,6 +53,43 @@ def parse_command(text):
         )
     ):
         return "onmap_load"
+
+    if (
+        "표고" in t
+        and "경사" in t
+        and (
+            "분석" in t
+            or "산출" in t
+            or "지도" in t
+            or "엑셀" in t
+            or "출력" in t
+        )
+    ):
+        return "terrain_both"
+
+    if (
+        "표고" in t
+        and (
+            "분석" in t
+            or "산출" in t
+            or "지도" in t
+            or "엑셀" in t
+            or "출력" in t
+        )
+    ):
+        return "elevation_analysis"
+
+    if (
+        "경사" in t
+        and (
+            "분석" in t
+            or "산출" in t
+            or "지도" in t
+            or "엑셀" in t
+            or "출력" in t
+        )
+    ):
+        return "slope_analysis"
 
     if (
         "지목" in t
@@ -82,13 +118,6 @@ def parse_command(text):
         and ("불러" in t or "가져" in t)
     ):
         return "cadastral_load"
-
-    if (
-        "표고" in t
-        and "경사" in t
-        and ("엑셀" in t or "출력" in t)
-    ):
-        return "terrain_excel"
 
     if (
         "생태자연도" in t

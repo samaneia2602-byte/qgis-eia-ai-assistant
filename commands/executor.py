@@ -9,6 +9,7 @@ from .parser import parse_command
 from ..analysis.cadastral_stats import run_cadastral_area_analysis
 from ..analysis.ecology_stats import run_ecology_analysis
 from ..analysis.jimok import cleanup_jimok
+from ..analysis.terrain_vector import run_vector_terrain_analysis
 from ..analysis.workflow_engine import FullAnalysisWorkflow
 from ..api.api_manager import ApiManager
 from ..api.ngii import NgiiManager
@@ -61,12 +62,20 @@ class CommandExecutor:
         if cmd == "ecology_wfs":
             return self.api.load_ecology_wfs()
 
-        if cmd == "terrain_excel":
-            self.log(
-                "표고·경사 분석은 analysis/terrain.py "
-                "확장 모듈에서 실행하도록 구조화되어 있습니다."
+        if cmd == "elevation_analysis":
+            return self.terrain_analysis(
+                "elevation"
             )
-            return
+
+        if cmd == "slope_analysis":
+            return self.terrain_analysis(
+                "slope"
+            )
+
+        if cmd == "terrain_both":
+            return self.terrain_analysis(
+                "both"
+            )
 
         if cmd == "cadastral_load":
             return self.load_cadastral_and_cleanup()
@@ -228,6 +237,84 @@ class CommandExecutor:
             )
             self.log(str(exc))
             return None
+
+    def terrain_analysis(self, mode):
+        if mode == "elevation":
+            title = "사업지역 표고 분석"
+            default_name = "사업지역_표고_분석.xlsx"
+        elif mode == "slope":
+            title = "사업지역 경사 분석"
+            default_name = "사업지역_경사_분석.xlsx"
+        else:
+            title = "사업지역 표고·경사 분석"
+            default_name = "사업지역_표고경사_분석.xlsx"
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self.iface.mainWindow(),
+            "%s 보고서 저장" % title,
+            default_name,
+            "Excel 통합문서 (*.xlsx)",
+        )
+
+        if not output_path:
+            self.log(
+                "%s을 취소했습니다."
+                % title
+            )
+            return None
+
+        self.log("=" * 48)
+        self.log("%s을 시작합니다." % title)
+        self.log(
+            "수치지도 선택창에서 DXF·SHP·GPKG 파일을 "
+            "여러 개 선택할 수 있습니다."
+        )
+        self.log("=" * 48)
+
+        try:
+            result = run_vector_terrain_analysis(
+                self.iface,
+                mode,
+                output_path=output_path,
+                log_callback=self.log,
+            )
+        except Exception as exc:
+            self.log(
+                "오류: %s에 실패했습니다."
+                % title
+            )
+            self.log(str(exc))
+            return None
+
+        for analysis_result in result.get(
+            "results",
+            {},
+        ).values():
+            for line in analysis_result.get(
+                "chat_lines",
+                [],
+            ):
+                self.log(line)
+
+            if analysis_result.get("output_path"):
+                self.log(
+                    "Excel 저장: %s"
+                    % analysis_result["output_path"]
+                )
+
+        self.log(
+            "%s 완료: 수치지도 %s개, 표고 샘플점 %s개"
+            % (
+                title,
+                len(result.get("source_files", [])),
+                result.get(
+                    "sample_result",
+                    {},
+                ).get("point_count", 0),
+            )
+        )
+
+        return result
 
     def load_cadastral_and_cleanup(self):
         layer = self.api.load_vworld_cadastral()
