@@ -613,6 +613,7 @@ class ApiManager:
             "dgre",
             "grade",
             "grd",
+            "eczm_grad",
             "eczm_grade",
             "eczm_grd",
             "ecology_grade",
@@ -694,6 +695,8 @@ class ApiManager:
                 "별도",
                 "4",
                 "04",
+                "9",
+                "09",
                 "special",
                 "separate",
             )
