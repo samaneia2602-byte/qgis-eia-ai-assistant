@@ -8,6 +8,7 @@ import numpy as np
 from osgeo import gdal, ogr, osr
 
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtWidgets import QMessageBox
 from qgis.core import (
     QgsColorRampShader,
     QgsCoordinateReferenceSystem,
@@ -24,6 +25,7 @@ from qgis.core import (
 from .numeric_map import (
     NumericMapProcessor,
     choose_numeric_map_files,
+    request_numeric_map_crs,
 )
 from .report_engine import ReportEngine, ReportSection
 
@@ -597,6 +599,12 @@ def run_vector_terrain_analysis(
         log_callback,
         "[2/6] 원본 좌표계를 판별하고 등고선을 자동 추출합니다.",
     )
+    crs_selection = request_numeric_map_crs(
+        iface,
+        business,
+        log_callback,
+    )
+
     processor = NumericMapProcessor(
         iface,
         log_callback,
@@ -605,7 +613,43 @@ def run_vector_terrain_analysis(
         paths,
         business,
         add_contour_layer=True,
+        forced_source_authid=crs_selection[
+            "selected_authid"
+        ],
     )
+
+    contour_layer = sample_result.get(
+        "contour_layer"
+    )
+    if contour_layer is not None:
+        iface.setActiveLayer(contour_layer)
+        iface.zoomToActiveLayer()
+        iface.mapCanvas().refresh()
+
+    answer = QMessageBox.question(
+        iface.mainWindow(),
+        "수치지도 위치 확인",
+        (
+            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?
+
+"
+            "예: 분석을 계속합니다.
+"
+            "아니오: 분석을 중단하고 다른 좌표계로 다시 실행합니다."
+        ),
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+
+    if answer != QMessageBox.Yes:
+        if contour_layer is not None:
+            QgsProject.instance().removeMapLayer(
+                contour_layer.id()
+            )
+        raise RuntimeError(
+            "사용자가 수치지도 위치가 맞지 않다고 확인하여 "
+            "분석을 중단했습니다. 다른 좌표계를 선택해 다시 실행하세요."
+        )
 
     work_dir = os.path.join(
         tempfile.gettempdir(),
@@ -822,12 +866,56 @@ def load_and_prepare_numeric_maps(
             "수치지도 선택이 취소되었습니다."
         )
 
+    crs_selection = request_numeric_map_crs(
+        iface,
+        business,
+        log_callback,
+    )
+
     processor = NumericMapProcessor(
         iface,
         log_callback,
     )
-    return processor.prepare(
+    result = processor.prepare(
         paths,
         business,
         add_contour_layer=True,
+        forced_source_authid=crs_selection[
+            "selected_authid"
+        ],
     )
+
+    contour_layer = result.get(
+        "contour_layer"
+    )
+    if contour_layer is not None:
+        iface.setActiveLayer(contour_layer)
+        iface.zoomToActiveLayer()
+        iface.mapCanvas().refresh()
+
+    answer = QMessageBox.question(
+        iface.mainWindow(),
+        "수치지도 위치 확인",
+        (
+            "자동 추출한 등고선이 사업지역과 올바르게 겹칩니까?
+
+"
+            "예: 전처리를 완료합니다.
+"
+            "아니오: 결과를 삭제하고 다시 좌표계를 선택합니다."
+        ),
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+
+    if answer != QMessageBox.Yes:
+        if contour_layer is not None:
+            QgsProject.instance().removeMapLayer(
+                contour_layer.id()
+            )
+        raise RuntimeError(
+            "사용자가 수치지도 위치가 맞지 않다고 확인했습니다."
+        )
+
+    result["crs_selection"] = crs_selection
+    return result

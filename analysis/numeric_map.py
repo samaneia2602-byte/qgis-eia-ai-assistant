@@ -9,7 +9,7 @@ import numpy as np
 from osgeo import ogr, osr
 
 from qgis.PyQt.QtCore import QVariant
-from qgis.PyQt.QtWidgets import QFileDialog
+from qgis.PyQt.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -139,6 +139,146 @@ def choose_numeric_map_files(iface):
     return paths
 
 
+
+def _business_center_wgs84(business_layer):
+    transform = QgsCoordinateTransform(
+        business_layer.crs(),
+        QgsCoordinateReferenceSystem("EPSG:4326"),
+        QgsProject.instance().transformContext(),
+    )
+    return transform.transform(
+        business_layer.extent().center()
+    )
+
+
+def _recommend_korea_belt(lon):
+    """
+    사업지역 중심 경도에 따라 Korea 2000 TM 원점을 추천합니다.
+
+    경계부에서는 사용자가 QGIS 좌표계 선택 경험에 따라
+    직접 다른 EPSG를 선택할 수 있습니다.
+    """
+    if lon < 126.0:
+        return "EPSG:5185"
+    if lon < 128.0:
+        return "EPSG:5186"
+    if lon < 130.0:
+        return "EPSG:5187"
+    return "EPSG:5188"
+
+
+def request_numeric_map_crs(
+    iface,
+    business_layer,
+    log_callback=None,
+):
+    """
+    사용 지역을 입력받고 추천 좌표계를 사용자에게 확인받습니다.
+    주소는 판단 보조정보이며, 실제 추천은 사업지역 중심 경도를
+    기준으로 합니다.
+    """
+    center = _business_center_wgs84(
+        business_layer
+    )
+    recommended = _recommend_korea_belt(
+        center.x()
+    )
+
+    address, accepted = QInputDialog.getText(
+        iface.mainWindow(),
+        "수치지도 좌표계 추천",
+        (
+            "수치지도의 제작지역 주소를 시·군·구 또는 읍·면·동 "
+            "단위로 입력하세요.\n"
+            "예: 강원특별자치도 강릉시 성산면"
+        ),
+    )
+
+    if not accepted:
+        raise RuntimeError(
+            "수치지도 좌표계 선택이 취소되었습니다."
+        )
+
+    descriptions = {
+        "EPSG:5185": "Korea 2000 / West Belt 2010",
+        "EPSG:5186": "Korea 2000 / Central Belt 2010",
+        "EPSG:5187": "Korea 2000 / East Belt 2010",
+        "EPSG:5188": "Korea 2000 / East Sea Belt 2010",
+        "EPSG:5179": "Korea 2000 / Unified CS",
+    }
+
+    ordered = [
+        recommended,
+        "EPSG:5185",
+        "EPSG:5186",
+        "EPSG:5187",
+        "EPSG:5188",
+        "EPSG:5179",
+    ]
+
+    unique = []
+    for authid in ordered:
+        if authid not in unique:
+            unique.append(authid)
+
+    items = [
+        "%s — %s%s"
+        % (
+            authid,
+            descriptions[authid],
+            " (추천)" if authid == recommended else "",
+        )
+        for authid in unique
+    ]
+
+    selected, accepted = QInputDialog.getItem(
+        iface.mainWindow(),
+        "수치지도 좌표계 적용",
+        (
+            "입력 지역: %s\n"
+            "사업지역 중심: 경도 %.6f, 위도 %.6f\n"
+            "수치지도에 적용할 좌표계를 선택하세요."
+            % (
+                address.strip() or "미입력",
+                center.x(),
+                center.y(),
+            )
+        ),
+        items,
+        0,
+        False,
+    )
+
+    if not accepted:
+        raise RuntimeError(
+            "수치지도 좌표계 적용이 취소되었습니다."
+        )
+
+    selected_authid = selected.split("—", 1)[0].strip()
+
+    _log(
+        log_callback,
+        "수치지도 제작지역: %s"
+        % (address.strip() or "미입력"),
+    )
+    _log(
+        log_callback,
+        "추천 좌표계: %s / 사용자 선택: %s"
+        % (
+            recommended,
+            selected_authid,
+        ),
+    )
+
+    return {
+        "address": address.strip(),
+        "recommended_authid": recommended,
+        "selected_authid": selected_authid,
+        "center_lon": center.x(),
+        "center_lat": center.y(),
+    }
+
+
 class NumericMapProcessor:
     """
     국토지리정보원 수치지도 전처리기.
@@ -164,6 +304,7 @@ class NumericMapProcessor:
         paths,
         business_layer,
         add_contour_layer=True,
+        forced_source_authid=None,
     ):
         if not paths:
             raise RuntimeError("수치지도 파일을 선택하지 않았습니다.")
@@ -224,11 +365,20 @@ class NumericMapProcessor:
                 if not extent:
                     continue
 
-                source_authid, distance_km, swap_xy = self._resolve_source_crs(
-                    ogr_layer,
-                    extent,
-                    business_center_wgs84,
-                )
+                if forced_source_authid:
+                    source_authid = forced_source_authid
+                    distance_km = self._distance_for_authid(
+                        extent,
+                        source_authid,
+                        business_center_wgs84,
+                    )
+                    swap_xy = False
+                else:
+                    source_authid, distance_km, swap_xy = self._resolve_source_crs(
+                        ogr_layer,
+                        extent,
+                        business_center_wgs84,
+                    )
 
                 _log(
                     self.log,
@@ -369,6 +519,35 @@ class NumericMapProcessor:
         )
         return transform.transformBoundingBox(
             business_layer.extent()
+        )
+
+    def _distance_for_authid(
+        self,
+        extent,
+        authid,
+        business_center_wgs84,
+    ):
+        center_x = (
+            float(extent[0]) + float(extent[1])
+        ) / 2.0
+        center_y = (
+            float(extent[2]) + float(extent[3])
+        ) / 2.0
+
+        result = self._transform_xy_to_wgs84(
+            center_x,
+            center_y,
+            authid,
+        )
+        if result is None:
+            return 9999.0
+
+        lon, lat = result
+        return self._haversine_km(
+            lon,
+            lat,
+            business_center_wgs84.x(),
+            business_center_wgs84.y(),
         )
 
     def _resolve_source_crs(
