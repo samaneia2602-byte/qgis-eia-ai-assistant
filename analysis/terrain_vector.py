@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import csv
 import math
 import os
 import tempfile
@@ -512,6 +513,111 @@ def _build_report(
     return engine
 
 
+
+def _export_report_safely(
+    mode,
+    rows,
+    stats,
+    business_name,
+    source_files,
+    output_path,
+    log_callback=None,
+):
+    """
+    openpyxl이 있으면 기존 Excel 보고서를 만들고,
+    QGIS Python 환경에 openpyxl이 없으면 CSV로 자동 대체합니다.
+
+    보고서 저장 실패 때문에 이미 완료된 DEM·표고·경사 분석까지
+    실패 처리되지 않도록 분리합니다.
+    """
+    try:
+        return _build_report(
+            mode,
+            rows,
+            stats,
+            business_name,
+            source_files,
+        ).export_excel(output_path)
+    except Exception as exc:
+        message = str(exc)
+
+        if (
+            "openpyxl" not in message.lower()
+            and not isinstance(exc, ImportError)
+        ):
+            _log(
+                log_callback,
+                "경고: Excel 보고서 생성에 실패했습니다: %s"
+                % exc,
+            )
+        else:
+            _log(
+                log_callback,
+                "참고: QGIS Python에 openpyxl이 없어 CSV 보고서로 저장합니다.",
+            )
+
+        root, _ = os.path.splitext(output_path)
+        csv_path = root + ".csv"
+        unit = "m" if mode == "elevation" else "°"
+        title = (
+            "사업지역 표고 분석"
+            if mode == "elevation"
+            else "사업지역 경사 분석"
+        )
+
+        with open(
+            csv_path,
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as stream:
+            writer = csv.writer(stream)
+            writer.writerow([title])
+            writer.writerow(["사업지역 레이어", business_name])
+            writer.writerow(
+                [
+                    "수치지도 파일",
+                    ", ".join(
+                        os.path.basename(path)
+                        for path in source_files
+                    ),
+                ]
+            )
+            writer.writerow(["최솟값", "%.2f%s" % (stats["minimum"], unit)])
+            writer.writerow(["최댓값", "%.2f%s" % (stats["maximum"], unit)])
+            writer.writerow(["평균값", "%.2f%s" % (stats["mean"], unit)])
+            writer.writerow(["표준편차", "%.2f%s" % (stats["stddev"], unit)])
+            writer.writerow([])
+            writer.writerow(
+                [
+                    "순번",
+                    "구간",
+                    "셀수",
+                    "면적(㎡)",
+                    "면적(ha)",
+                    "구성비(%)",
+                ]
+            )
+
+            for index, row in enumerate(rows, start=1):
+                writer.writerow(
+                    [
+                        index,
+                        row["구간"],
+                        row["셀수"],
+                        round(row["면적_m2"], 2),
+                        round(row["면적_ha"], 4),
+                        round(row["구성비_pct"], 2),
+                    ]
+                )
+
+        _log(
+            log_callback,
+            "CSV 보고서 저장: %s" % csv_path,
+        )
+        return csv_path
+
+
 def _chat_lines(mode, rows, stats):
     title = (
         "사업지역 표고 분석현황"
@@ -733,14 +839,14 @@ def run_vector_terrain_analysis(
                     )
                 )
 
-            saved_path = _build_report(
+            saved_path = _export_report_safely(
                 "elevation",
                 rows,
                 stats,
                 business.name(),
                 paths,
-            ).export_excel(
-                elevation_path
+                elevation_path,
+                log_callback,
             )
 
         results["elevation"] = {
@@ -808,14 +914,14 @@ def run_vector_terrain_analysis(
                     )
                 )
 
-            saved_path = _build_report(
+            saved_path = _export_report_safely(
                 "slope",
                 rows,
                 stats,
                 business.name(),
                 paths,
-            ).export_excel(
-                slope_output
+                slope_output,
+                log_callback,
             )
 
         results["slope"] = {
